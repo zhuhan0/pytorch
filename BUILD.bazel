@@ -239,6 +239,9 @@ filegroup(
             "aten/src/ATen/native/transformers/cuda/*.cpp",
         ],
     ),
+    includes = [
+        "third_party/cudnn_frontend/include",
+    ],
 )
 
 filegroup(
