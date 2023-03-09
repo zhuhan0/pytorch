@@ -1939,8 +1939,71 @@ class MiscTests(torch._dynamo.test_case.TestCase):
 
         self.assertTrue(same(ref, res))
 
-    @unittest.skipIf(sys.version_info < (3, 10), "use linetable when python >= 3.10")
-    def test_linetable_writer(self):
+    @unittest.skipIf(sys.version_info < (3, 11), "linetable test for Python 3.11")
+    def test_linetable_311_writer1(self):
+        def fn():
+            a = 10
+            b = 20
+            c = a + b
+            f = "linetable_writer"
+            return f"Test if {f} generates correct co_linetable: {c}"
+
+        # Dynamo doesn't deal with column locations or end line numbers,
+        # so we only check that start line numbers in the linetables match.
+        keys = bytecode_transformation.get_code_keys()
+        code_options = {k: getattr(fn.__code__, k) for k in keys}
+        result = bytecode_transformation.clean_and_assemble_instructions(
+            bytecode_transformation.cleaned_instructions(fn.__code__), keys, code_options
+        )
+        l1, l2 = list(fn.__code__.co_positions()), list(result[1].co_positions())
+        self.assertEqual(len(l1), len(l2))
+        for p1, p2 in zip(l1, l2):
+            # check that start line numbers match
+            self.assertEqual(p1[0], p2[0])
+        self.assertEqual(fn.__code__.co_lnotab, result[1].co_lnotab)
+
+
+    @unittest.skipIf(sys.version_info < (3, 11), "linetable test for Python 3.11")
+    def test_linetable_311_writer2(self):
+        """
+        test large ops (LOAD_METHOD) and EXTENDED_ARGS
+        fn_str is in the form:
+        def fn():
+            ...
+            x0 = 1
+            x1 = 1
+            ...
+            l = [x0, x1, ...]
+        """
+        fn_str = f"""\
+def fn():
+    foo.bar(1, 2, 3)
+{str(chr(10)).join(' ' * 4 + 'x' + str(i) + ' = 1' for i in range(1 << 9))}
+    l = [{str(' ').join('x' + str(i) + ',' for i in range(1 << 9))}]
+        """
+        locals = {}
+        exec(fn_str, {}, locals)
+        fn = locals["fn"]
+        orig_inst_str = "\n".join(list(map(str, dis.get_instructions(fn))))
+        self.assertIn("EXTENDED_ARG", orig_inst_str)
+        self.assertIn("LOAD_METHOD", orig_inst_str)
+        keys = bytecode_transformation.get_code_keys()
+        code_options = {k: getattr(fn.__code__, k) for k in keys}
+        result = bytecode_transformation.clean_and_assemble_instructions(
+            bytecode_transformation.cleaned_instructions(fn.__code__), keys, code_options
+        )
+        new_inst_str = "\n".join(list(map(str, result[0])))
+        self.assertIn("EXTENDED_ARG", new_inst_str)
+        self.assertIn("LOAD_METHOD", new_inst_str)
+        l1, l2 = list(fn.__code__.co_positions()), list(result[1].co_positions())
+        self.assertEqual(len(l1), len(l2))
+        for p1, p2 in zip(l1, l2):
+            # check that start line numbers match
+            self.assertEqual(p1[0], p2[0])
+        self.assertEqual(fn.__code__.co_lnotab, result[1].co_lnotab)
+
+    @unittest.skipIf(sys.version_info < (3, 10) or sys.version_info >= (3, 11), "linetable test for Python 3.10")
+    def test_linetable_310_writer(self):
         def fn():
             a = 10
             b = 20
@@ -4565,12 +4628,12 @@ class MiscTests(torch._dynamo.test_case.TestCase):
                 new_inst("RESUME", 0),
                 new_inst("JUMP_FORWARD", target=jump_to_target_inst),
                 targets[0],
-                new_inst("LOAD_GLOBAL", argval="print"),
+                new_inst("LOAD_GLOBAL", 0, "print"),
                 new_inst("POP_TOP"),
                 new_inst("RETURN_VALUE"),
                 jump_to_target_inst,
                 new_inst("LOAD_CONST", 2),
-                new_inst("LOAD_GLOBAL", argval="print"),
+                new_inst("LOAD_GLOBAL", 0, "print"),
                 new_inst("POP_TOP"),
                 new_inst("RETURN_VALUE"),
                 targets[1],
@@ -4632,8 +4695,60 @@ class MiscTests(torch._dynamo.test_case.TestCase):
             dummy_fn.__code__ = code
             self.assertEqual(dummy_fn(), test[3])
 
-            # TODO should also pass the code object back into dynamo again, but
-            # dynamo is not enabled for Python 3.11 yet.
+            dummy_opt = torch._dynamo.optimize("eager")(dummy_fn)
+            self.assertEqual(dummy_opt(), test[3])
+
+    def test_encode_varint(self):
+        nums = [
+            0b111_101010_000000,
+            0b1100_111000_010101_101010,
+        ]
+        b = bytecode_transformation.encode_exn_tab_varint(nums[0]) + bytecode_transformation.encode_exn_tab_varint(nums[1])
+        nums_new = []
+        b_iter = iter(bytes(b))
+        while True:
+            try:
+                nums_new.append(bytecode_transformation.decode_exn_tab_varint(b_iter))
+            except StopIteration:
+                break
+        self.assertEqual(nums, nums_new)
+
+    @unittest.skipIf(sys.version_info < (3, 11), "requires Python 3.11+")
+    def test_exceptiontable_parsing(self):
+        def fn():
+            try:
+                with a():
+                    b()
+                c()
+            except:
+                d()
+            finally:
+                e()
+            f()
+
+        tab = bytecode_transformation.parse_exception_table(fn.__code__.co_exceptiontable)
+        b = bytecode_transformation.assemble_exception_table(tab)
+        self.assertEqual(b, fn.__code__.co_exceptiontable)
+
+    @unittest.skipIf(sys.version_info < (3, 11), "requires Python 3.11+")
+    def test_exceptiontable_e2e(self):
+        def fn():
+            try:
+                with a():
+                    b()
+                c()
+            except:
+                d()
+            finally:
+                e()
+            f()
+
+        def nothing(*args):
+            pass
+
+        code = bytecode_transformation.transform_code_object(fn.__code__, nothing)
+        self.assertEqual(code.co_exceptiontable, fn.__code__.co_exceptiontable)
+
 
     def test_ordered_dict_alias_reconstruct(self):
         od = collections.OrderedDict
