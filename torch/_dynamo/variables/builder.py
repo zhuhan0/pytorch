@@ -4,7 +4,6 @@ import enum
 import functools
 import inspect
 import operator
-import re
 import types
 from typing import Any, NamedTuple, Optional, Union
 
@@ -28,7 +27,6 @@ from ..source import (
     GlobalSource,
     GlobalWeakRefSource,
     is_constant_source,
-    LocalInputSource,
     LocalSource,
     RandomValueSource,
     Source,
@@ -44,6 +42,7 @@ from ..utils import (
     is_numpy_int_type,
     is_typing,
     istype,
+    normalize_attr_name,
     np,
     odict_values,
     preserve_rng_state,
@@ -125,11 +124,6 @@ class GraphArg:
             assert isinstance(
                 self.fake_tensor, torch._subclasses.fake_tensor.FakeTensor
             )
-            # Mapping for downstream systems to remap back into dynamo arg positions
-            if isinstance(self.source, LocalInputSource):
-                if "graph_arg_pos" not in self.fake_tensor.__dict__:
-                    self.fake_tensor.__dict__["graph_arg_pos"] = []
-                self.fake_tensor.__dict__["graph_arg_pos"].append(self.source.pos)
         if isinstance(self.example, torch._subclasses.fake_tensor.FakeTensor):
             raise AssertionError("Fake Tensor observed in TorchDynamo Fx graph inputs")
 
@@ -572,7 +566,7 @@ class VariableBuilder:
         elif is_constant_source(self.get_source()):
             return self.tx.output.register_attr_or_module(
                 value,
-                re.sub(r"[^a-zA-Z0-9]+", "_", self.name),
+                normalize_attr_name(self.name),
                 source=None,
                 sym_num=value
                 # shape Guards live their own rich life via shape_env
@@ -580,7 +574,7 @@ class VariableBuilder:
         return SymNodeVariable.create(
             tx=self.tx,
             proxy=self.tx.output.create_graph_input(
-                re.sub(r"[^a-zA-Z0-9]+", "_", self.name), type(value)
+                normalize_attr_name(self.name), type(value)
             ),
             sym_num=value
             # shape Guards live their own rich life via shape_env
@@ -714,7 +708,7 @@ class VariableBuilder:
         if is_constant_source(self.get_source()):
             return self.tx.output.register_attr_or_module(
                 value,
-                re.sub(r"[^a-zA-Z0-9]+", "_", self.name),
+                normalize_attr_name(self.name),
                 source=self.get_source(),
                 # Guards are added inside register_attr_or_module
             )
@@ -743,7 +737,7 @@ class VariableBuilder:
             ignore_subclass = False
 
         tensor_proxy = self.tx.output.create_graph_input(
-            re.sub(r"[^a-zA-Z0-9]+", "_", self.name), type(value)
+            normalize_attr_name(self.name), type(value)
         )
         tensor_variable = wrap_fx_proxy(
             tx=self.tx,
@@ -815,7 +809,7 @@ class VariableBuilder:
                 options.update({"raw_value": value})
 
             proxy = self.tx.output.create_graph_input(
-                re.sub(r"[^a-zA-Z0-9]+", "_", self.name), type(wrapped_value)
+                normalize_attr_name(self.name), type(wrapped_value)
             )
 
             unspec_var = wrap_fx_proxy_cls(
