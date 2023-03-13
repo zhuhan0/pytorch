@@ -19,7 +19,7 @@ from torch._prims_common import (
     is_integer_dtype,
 )
 from torch._subclasses.meta_utils import MetaConverter
-from torch.fx.experimental.symbolic_shapes import DIM_DYNAMISM_STATE
+from torch.fx.experimental.symbolic_shapes import DIM_DYNAMISM_STATE, MinMaxConstraint
 from torch.fx.operator_schemas import normalize_function
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.overrides import TorchFunctionMode
@@ -244,6 +244,7 @@ class FakeTensorConverter:
         *,
         source=None,
         dynamic_dims=None,
+        dynamic_dims_range=None,
     ):
         maybe_memo = self._get_memo(t)
         if maybe_memo is not None:
@@ -278,6 +279,7 @@ class FakeTensorConverter:
             ignore_subclass=ignore_subclass,
             source=source,
             dynamic_dims=dynamic_dims,
+            dynamic_dims_range=dynamic_dims_range,
         )
         if out is NotImplemented:
             raise UnsupportedFakeTensorException("meta converter nyi")
@@ -314,6 +316,7 @@ class FakeTensorConverter:
         ignore_subclass=False,
         source=None,
         dynamic_dims=None,
+        dynamic_dims_range=None,
     ):
         return self.from_real_tensor(
             fake_mode,
@@ -323,6 +326,7 @@ class FakeTensorConverter:
             ignore_subclass=ignore_subclass,
             source=source,
             dynamic_dims=dynamic_dims,
+            dynamic_dims_range=dynamic_dims_range,
         )
 
 
@@ -1396,10 +1400,12 @@ class FakeTensorMode(TorchDispatchMode):
         ignore_subclass=False,
         source: Optional[Source] = None,
         dynamic_dims: Optional[List[DIM_DYNAMISM_STATE]] = None,
+        dynamic_dims_range: Optional[Dict[int, MinMaxConstraint]] = None,
     ):
         if static_shapes:
             # Unreachable state if using dynamo, but good to double check anyway
             assert dynamic_dims is None
+            assert dynamic_dims_range is None
             return self.fake_tensor_converter(
                 self, tensor, ignore_subclass=ignore_subclass, source=source
             )
@@ -1410,6 +1416,7 @@ class FakeTensorMode(TorchDispatchMode):
             ignore_subclass=ignore_subclass,
             source=source,
             dynamic_dims=dynamic_dims,
+            dynamic_dims_range=dynamic_dims_range,
         )
 
 

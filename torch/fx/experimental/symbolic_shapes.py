@@ -196,6 +196,24 @@ def guard_scalar(a):
 
 # inclusive both ways
 def constrain_range(a, *, min: Optional[int], max: Optional[int] = None):
+    """
+    Constrain range takes a symbol, and records a valid value range for it in the graph.
+    That value range is the narrowest intersection of the current value range for the symbol.
+
+    Ex:
+    constrain_range(x, min=3, max=10)
+    constrain_range(x, min=4, max=12)
+
+    Would have a range of (4, 10)
+
+    min and max are optional, and not specifying one will leave the range unbounded, but
+    still constrained to any past min or maxes, as in the comment above.
+
+    In this way, it is a one directional api - it can only constrain ranges for a shape further.
+
+    Setting this flag records the range into the user_constrained field on shape_env. See the docs on that field
+    for more information.
+    """
     if min is None:
         min = -sympy.oo
     if max is None:
@@ -1198,7 +1216,8 @@ class ShapeEnv:
         self, *,
         allow_scalar_outputs=True,
         allow_dynamic_output_shape_ops=True,
-        strict_mark_dyn=False,
+        # Note - On 0/1 specialization
+        #
         # The following options affect decisions we make about eager
         # specialization.  Disabling them will increase trace time (as we do
         # more symbolic reasoning) and can also harm the quality of generated
@@ -1238,7 +1257,6 @@ class ShapeEnv:
             self.val_to_var = {0: sympy.Integer(0), 1: sympy.Integer(1)}
         self.unbacked_symfloat_counter = itertools.count()
         self.unbacked_symint_counter = itertools.count()
-        self.strict_mark_dyn = strict_mark_dyn
         self.specialize_zero_one = specialize_zero_one
         self.duck_shape = duck_shape
 
@@ -1280,7 +1298,8 @@ class ShapeEnv:
     def create_symbolic_sizes_strides_storage_offset(self,
                                                      ex: torch.Tensor,
                                                      source: Source,
-                                                     dynamic_dims: Optional[List[DIM_DYNAMISM_STATE]]):
+                                                     dynamic_dims: Optional[List[DIM_DYNAMISM_STATE]],
+                                                     dynamic_dims_range: Dict[int, "MinMaxConstraint"]):
         """
         Returns a list of symbolic sizes and strides for the given tensor.
         We try our best to express stride in terms of the sizes, so as to not
@@ -1321,6 +1340,16 @@ class ShapeEnv:
                 )
         assert all(x is not None for x in stride)
         sym_size = [self.create_symintnode(i, hint=hint) for i, hint in zip(size, ex.size())]
+
+        for i, syms in enumerate(sym_size):
+            user_constrained = dynamic_dims_range and i in dynamic_dims_range
+            if user_constrained:
+                msg = "Illegal state. User constrained dims must be marked as such in dynamic_dims"
+                assert dynamic_dims and dynamic_dims[i] == DIM_DYNAMISM_STATE.DYNAMIC, msg
+                constraint = dynamic_dims_range[i]
+                if constraint != MinMaxConstraint.NONE():
+                    constrain_range(syms, min=constraint.min, max=constraint.max)
+
         sym_stride = []
         for i, stride_expr in enumerate(stride):
             # NB: Don't duck size the stride; instead use the expression
@@ -1375,11 +1404,7 @@ class ShapeEnv:
                 self.val_to_var[val] = sympy_expr
 
             # We also infer that it must be not 0/1
-            lower = 2 if self.specialize_zero_one else 0
-            # NB: sys.maxsize is NOT allowed for sizes, because we use MAX_INT
-            # as a sentinel sometimes.  Your sizevar isn't going to be
-            # anywhere near the max 64-bit integer anyway.
-            self.var_to_range[sympy_expr] = ValueRanges(lower, sys.maxsize - 1)
+            self.var_to_range[sympy_expr] = _default_value_range(specialize_zero_one=self.specialize_zero_one)
 
         if not dyn and self.duck_shape:
             # This implements duck-shaping: input sizes that match are assigned
@@ -1418,14 +1443,19 @@ class ShapeEnv:
     # For convenience in testing, a source is allowed to be a str,
     # in which case we will assume it is a LocalSource
     #
+    # strict_mark_dyn lets you enforce stricter dynamic dim verification. When this flag is set,
+    # we assert that there are *no* constraints on the dim. If the flag is not set, we allow
+    # any constraining that allows for more than 2 values, aka, as long as it is not constrained to a single
+    # value.
+    #
     # simplified lets you omit duck sizing, equality and 0/1 guards.
     # This is useful for testing when you don't care about the boilerplate
     # guards, and it may be helpful for user output too (be careful though;
     # some equality guards are nontrivial!  It would be nice to get simplified
     # output to print them too).  It's private because it's not
     # intended for normal use
-    def produce_guards(self, placeholders, sources, dynamic_indices: Set[int],
-                       source_ref=lambda n: n.name(), *, _simplified=False) -> List[str]:
+    def produce_guards(self, placeholders, sources, dynamic_ranges: Dict[int, "MinMaxConstraint"],
+                       source_ref=lambda n: n.name(), *, strict_mark_dyn=False, _simplified=False) -> List[str]:
         # It took a lot of sweat to figure out the algorithm here.  Let's
         # explain how it works.
         #
@@ -1526,12 +1556,25 @@ class ShapeEnv:
             # user directives about relationships, we can remove this check from
             # verification.
             if len(expr.free_symbols) == 1:
-                srcs = symbol_to_source[expr.free_symbols.pop()]
+                symbol = expr.free_symbols.pop()
+                # NOTE! Manual user directives override the rule around not allowing any constraining of dynamic dims
+                # [NOTE - on user_constrained]
+                # User constrained symbols have an entry in var_to_range, but some of their range
+                # comes from manual user directives like dynamo's constrain api. This distinction is maintained
+                # for the purposes of protecting and enforcing user directives. In strict_mark_dyn mode, we do not
+                # allow ANY constraining of values for a given symbol. However, if this symbol is user constrained, we
+                # relax this requirement in favor of honoring the user directive and allowing the user specified range.
+                # We do this by checking of the range is unconstrained*.
+                #
+                # *unconstrained might mean a default unsound 0/1 constraint.
+                if self.var_to_range[symbol] != _default_value_range(specialize_zero_one=self.specialize_zero_one):
+                    return
+                srcs = symbol_to_source[symbol]
                 for src in srcs:
                     if src in dynamic_sources:
                         raise RuntimeError(f"Attempting to introduce a guard {potential_expr} that violates user's constraint")
 
-        for t, source, dyn_dims in zip(placeholders, sources, dynamic_indices):
+        for t, source, dyn_dims in zip(placeholders, sources, dynamic_ranges):
             if isinstance(source, str):
                 from torch._dynamo.source import LocalSource
                 source = LocalSource(source)
@@ -1552,6 +1595,11 @@ class ShapeEnv:
                         raise RuntimeError(f"Attempting to constrain dimension "
                                            f"{source.name()}.size()[{i}] to {int(ss)}, "
                                            "which violates user's constraints")
+
+                    vr = dyn_dims[i].to_range()
+                    if vr != _default_value_range(specialize_zero_one=self.specialize_zero_one):
+                        for symbol in ss.node.expr.free_symbols:
+                            self._verify_valid_range(symbol, vr)
                     dynamic_sources.append(property_source)
             for i, ss in enumerate(t.stride()):
                 track_symint(TensorPropertySource(source, TensorProperty.STRIDE, i), ss)
@@ -1583,7 +1631,7 @@ class ShapeEnv:
             try:
                 guard_expr = ShapeGuardPrinter(symbol_to_source, source_ref, self.var_to_sources).doprint(g)
                 exprs.append(guard_expr)
-                if self.strict_mark_dyn:
+                if strict_mark_dyn:
                     _verify(g, guard_expr)
             except Exception:
                 log.warning(f"Failing guard allocated at: \n{tb}")
@@ -1596,6 +1644,16 @@ class ShapeEnv:
         # these should probably get reported in tests too
         if not _simplified:
             for symbol, sources in symbol_to_source.items():
+
+                # TODO(voz): Should this valid range actually come from the passed in dynamic_ranges?
+                # On one hand, yes! It's a lot more like the contract we agreed upon with verification
+                # with regards to produce_guards in the first place.
+                # On the other hand, self.var_to_range is pretty useful to check too!
+                vr = self.var_to_range[symbol]
+                if vr != _default_value_range(specialize_zero_one=self.specialize_zero_one):
+                    self._verify_valid_range(symbol, vr)
+
+
                 assert sources
                 assert symbol.is_integer
                 r = self.var_to_range[symbol]
@@ -1902,6 +1960,13 @@ class ShapeEnv:
             self.evaluate_expr(eq_expr)
         return self.simplify(expr)
 
+    def _verify_valid_range(self, symbol, valid_range):
+        if symbol not in self.var_to_val:
+            return
+        if has_hint(symbol) and self.size_hint(symbol) not in valid_range:
+            raise RuntimeError(f"Valid range, {valid_range}, contradicts "
+                               f"traced value of {symbol}, {self.size_hint(symbol)}")
+
     @lru_cache(256)
     def evaluate_expr(self, expr: "sympy.Expr", hint=None):
         """
@@ -1958,9 +2023,48 @@ class ShapeEnv:
                     ShapeGuard(sympy.Eq(expr, concrete_val), stack))  # type: ignore[arg-type]
         return concrete_val
 
+class MinMaxConstraint:
+    min: Optional[Union[int, sympy.core.numbers.NegativeInfinity]]
+    max: Optional[Union[int, sympy.core.numbers.Infinity]]
+
+    def __init__(self, min=None, max=None):
+        self.min = min if min else -sympy.oo
+        self.max = max if max else sympy.oo
+        assert self.min < self.max, f"Illegal intersection produced! {self.min} < {self.max}"
+
+    @staticmethod
+    def NONE():
+        return MinMaxConstraint(min=-sympy.oo, max=sympy.oo)
+
+    def to_range(self) -> ValueRanges:
+        return ValueRanges(
+            self.min, self.max
+        )
+
+
+    def __repr__(self):
+        return f"({self.min}, {self.max})"
+
+    def __eq__(self, other):
+        return self.min == other.min and self.max == other.max
+
+
+def _dynamic_dim_range(t, d) -> MinMaxConstraint:
+    assert _is_dim_dynamic(t, d)
+    return t._dynamo_dynamic_ranges[d]
+
+
 def _is_int(expr):
     if not isinstance(expr, SymInt):
         return False
     if len(expr.node.expr.free_symbols) > 0:
         return False
     return True
+
+# See: Note - On 0/1 specialization
+# NB: sys.maxsize is NOT allowed for sizes, because we use MAX_INT
+# as a sentinel sometimes.  Your sizevar isn't going to be
+# anywhere near the max 64-bit integer anyway.
+def _default_value_range(*, specialize_zero_one: bool) -> ValueRanges:
+    lower = 2 if specialize_zero_one else 0
+    return ValueRanges(lower, sys.maxsize - 1)

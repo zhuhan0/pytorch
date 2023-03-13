@@ -1049,7 +1049,7 @@ def wrap_fx_proxy_cls(
 class TrackedFake:
     fake: Union[FakeTensor, SymInt]
     source: Source
-    dynamic_indices: Set[int]
+    dynamic_ranges: Set[int]
 
 
 def wrap_to_fake_tensor_and_record(
@@ -1062,15 +1062,15 @@ def wrap_to_fake_tensor_and_record(
     ):
         static_shapes, reason = tensor_always_has_static_shape(e, source, is_tensor)
 
-        dynamic_indices = None
-        if hasattr(e, "_dynamo_dynamic_indices"):
-            dynamic_indices = e._dynamo_dynamic_indices
+        dynamic_ranges = None
+        if hasattr(e, "_dynamo_dynamic_ranges"):
+            dynamic_ranges = e._dynamo_dynamic_ranges
             assert not static_shapes, tensor_static_reason_to_message(reason)
 
         if not static_shapes:
             dynamic_dims: List[DIM_DYNAMISM_STATE] = []
             for i, _ in enumerate(e.size()):
-                if dynamic_indices and i in dynamic_indices:
+                if dynamic_ranges and i in dynamic_ranges:
                     dynamic_dims.append(DIM_DYNAMISM_STATE.DYNAMIC)
                 else:
                     dynamic_dims.append(
@@ -1088,10 +1088,11 @@ def wrap_to_fake_tensor_and_record(
                 ignore_subclass=ignore_subclass,
                 source=source,
                 dynamic_dims=dynamic_dims,
+                dynamic_dims_range=dynamic_ranges,
             )
         )
         if is_tensor:
-            tx.output.tracked_fakes.append(TrackedFake(fake_e, source, dynamic_indices))
+            tx.output.tracked_fakes.append(TrackedFake(fake_e, source, dynamic_ranges))
         return fake_e
     else:
         return e
