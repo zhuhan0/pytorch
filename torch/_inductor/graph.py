@@ -86,9 +86,13 @@ class GraphLowering(torch.fx.Interpreter):
         else:
             from torch._dynamo.source import ConstantSource
 
+            from torch._dynamo.utils import dynamic_dims_from_tensor
+
             # TODO: this should not be needed once #93059 lands
             # https://github.com/pytorch/pytorch/pull/94031#discussion_r1096044816
             # TODO: make a dedicated UnknownSource for this?
+            constraint_dims = None
+            dynamic_dims = dynamic_dims_from_tensor(ex, constraint_dims)
             source = ConstantSource(
                 f"__unknown_tensor_{len(self._shape_env.var_to_val)}"
             )
@@ -96,7 +100,12 @@ class GraphLowering(torch.fx.Interpreter):
                 size,
                 stride,
                 _,
-            ) = self._shape_env.create_symbolic_sizes_strides_storage_offset(ex, source)
+            ) = self._shape_env.create_symbolic_sizes_strides_storage_offset(
+                ex,
+                source,
+                dynamic_dims=dynamic_dims,
+                constraint_dims=constraint_dims,
+            )
 
         size = [i.node.expr if isinstance(i, torch.SymInt) else i for i in size]
         stride = [i.node.expr if isinstance(i, torch.SymInt) else i for i in stride]

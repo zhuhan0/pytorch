@@ -1,10 +1,11 @@
 import contextlib
 import warnings
 import weakref
-from typing import ContextManager, Optional
+from typing import ContextManager, Dict, Optional
 
 import torch
 from torch._guards import Source
+from torch.fx.experimental.symbolic_shapes import DimDynamismState, MinMaxConstraint
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils.weak import WeakIdRef
 
@@ -160,7 +161,13 @@ class MetaConverter:
     # as part of this process, we will maintain this invariant!  (Even though
     # other users of this may not need it this property to be upheld.)
     def meta_tensor(
-        self, t, shape_env=None, callback=lambda t: t(), source: Optional[Source] = None
+        self,
+        t,
+        shape_env=None,
+        callback=lambda t: t(),
+        source: Optional[Source] = None,
+        dynamic_dims: Optional[Dict[int, DimDynamismState]] = None,
+        constraint_dims: Optional[Dict[int, MinMaxConstraint]] = None,
     ):
         if source is None:
             from torch._dynamo.source import ConstantSource
@@ -210,7 +217,12 @@ class MetaConverter:
 
         def sym_sizes_strides_storage_offset(t):
             if make_symbolic:
-                return shape_env.create_symbolic_sizes_strides_storage_offset(t, source)
+                return shape_env.create_symbolic_sizes_strides_storage_offset(
+                    t,
+                    source,
+                    dynamic_dims=dynamic_dims,
+                    constraint_dims=constraint_dims,
+                )
             return (t.size(), t.stride(), t.storage_offset())
 
         # see expired-storages
@@ -434,6 +446,8 @@ class MetaConverter:
                         shape_env,
                         callback,
                         source=AttrSource(source, "grad"),
+                        dynamic_dims=dynamic_dims,
+                        constraint_dims=constraint_dims,
                     )
                 torch._C._set_conj(r, t.is_conj())
                 torch._C._set_neg(r, t.is_neg())
@@ -451,6 +465,8 @@ class MetaConverter:
         callback=lambda t: t(),
         ignore_subclass=False,
         source=None,
+        dynamic_dims=None,
+        constraint_dims=None,
     ):
         # TODO: zero tensors?  We appear to have eliminated them by
         # excluding complex for now
@@ -499,7 +515,12 @@ class MetaConverter:
                     ctx = torch._C.DisableTorchFunctionSubclass()
                 with ctx:
                     r = self.meta_tensor(
-                        t, shape_env=shape_env, callback=callback, source=source
+                        t,
+                        shape_env=shape_env,
+                        callback=callback,
+                        source=source,
+                        dynamic_dims=dynamic_dims,
+                        constraint_dims=constraint_dims,
                     )
                 # TODO: this is suspicious, now that we have callback argument
                 if type(t) is torch.nn.Parameter:
