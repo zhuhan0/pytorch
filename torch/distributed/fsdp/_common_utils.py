@@ -50,6 +50,7 @@ class _FSDPState(_State):
         self.world_size: int = -1
         self.sharding_strategy = ShardingStrategy.FULL_SHARD
         self._use_orig_params: bool = False
+        self._align_addresses: bool = False
         self.training_state = TrainingState.IDLE
         self._unshard_params_ctx: Dict[nn.Module, Generator] = {}
         self._state_dict_type: StateDictType = StateDictType.FULL_STATE_DICT
@@ -123,7 +124,7 @@ def _module_handles(state: _FSDPState, module: nn.Module) -> List:
     if _is_composable(state):
         assert (
             module in state._fully_sharded_module_to_handles
-        ), f"Expects a `comm_module` but got {module} on rank {state.rank}"
+        ), f"Expects a fully sharded module but got {module} on rank {state.rank}"
         return state._fully_sharded_module_to_handles[module][:]
     else:
         # NOTE: This assumes `module` is a `FullyShardedDataParallel` instance.
@@ -212,7 +213,9 @@ def _get_param_to_fqns(
                 else [param_name]
             )  # prefixed from `module`
             global_fqns = [
-                clean_tensor_name(prefix + name) for name in local_fqns
+                clean_tensor_name(prefix + name)
+                for name in local_fqns
+                if name is not None
             ]  # prefixed from the top level `model` (i.e. including `prefix`)
             is_shared_param = param in param_to_fqns
             if not is_shared_param:
