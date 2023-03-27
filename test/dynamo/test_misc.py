@@ -37,6 +37,7 @@ from torch.ao.quantization.fake_quantize import FakeQuantize
 from torch.ao.quantization.qconfig import QConfig
 from torch.ao.quantization.quantize_fx import prepare_qat_fx
 from torch.autograd.profiler import _enable_dynamo_cache_lookup_profiler
+from torch.fx.experimental.symbolic_shapes import ConstraintViolationError
 from torch.nn import functional as F
 from torch.testing._internal.common_cuda import (
     PLATFORM_SUPPORTS_FUSED_SDPA,
@@ -4391,6 +4392,7 @@ class MiscTests(torch._dynamo.test_case.TestCase):
             compiler_fn=None,
             root_tx=None,
             export=False,
+            export_constraints=None,
         )
         # Contrived property so as not to have it be None
         graph.nn_modules = {}
@@ -4772,9 +4774,7 @@ class MiscTests(torch._dynamo.test_case.TestCase):
             return x.cos()
 
         torch._dynamo.mark_dynamic(y, 0)
-        with self.assertRaises(
-            torch._dynamo.exc.InternalTorchDynamoError,
-        ):
+        with self.assertRaises(ConstraintViolationError):
             torch._dynamo.optimize("eager")(my_dyn_fn)(y)
 
     @torch._dynamo.config.patch(dynamic_shapes=True)
@@ -4790,53 +4790,6 @@ class MiscTests(torch._dynamo.test_case.TestCase):
         torch._dynamo.mark_dynamic(y, 0)
         torch._dynamo.reset()
         torch._dynamo.optimize("eager")(my_dyn_fn)(y)
-
-    @torch._dynamo.config.patch(dynamic_shapes=True)
-    def test_raise_partial_constraint_range(self):
-        y = torch.randn([3, 3, 3])
-
-        def my_dyn_fn(x):
-            if x.shape[0] > 4:
-                return x.sin()
-            return x.cos()
-
-        torch._dynamo.mark_dynamic_constrain(y, 0, min=5, max=7)
-        with self.assertRaises(
-            torch._dynamo.exc.InternalTorchDynamoError,
-        ):
-            torch._dynamo.optimize("eager")(my_dyn_fn)(y)
-
-    @torch._dynamo.config.patch(dynamic_shapes=True)
-    def test_no_raise_partial_constraint_range(self):
-        y = torch.randn([5, 3, 3])
-
-        def my_dyn_fn(x):
-            if x.shape[0] > 4:
-                return x.sin()
-            return x.cos()
-
-        torch._dynamo.optimize("eager")(my_dyn_fn)(y)
-        torch._dynamo.mark_dynamic_constrain(y, 0, min=5, max=7)
-        torch._dynamo.reset()
-        torch._dynamo.optimize("eager")(my_dyn_fn)(y)
-
-    @torch._dynamo.config.patch(dynamic_shapes=True)
-    def test_raise_illegal_constraint_range(self):
-        y = torch.randn([5, 3, 3])
-        torch._dynamo.mark_dynamic_constrain(y, 0, min=5, max=7)
-        with self.assertRaisesRegex(
-            RuntimeError, "Attempt to constrain already constrained index 0"
-        ):
-            torch._dynamo.mark_dynamic_constrain(y, 0, min=2, max=4)
-
-    @torch._dynamo.config.patch(dynamic_shapes=True)
-    def test_raise_illegal_constraint_range_min_max_only(self):
-        y = torch.randn([5, 3, 3])
-        torch._dynamo.mark_dynamic_constrain(y, 0, min=5)
-        with self.assertRaisesRegex(
-            RuntimeError, "Attempt to constrain already constrained index 0"
-        ):
-            torch._dynamo.mark_dynamic_constrain(y, 0, max=4)
 
     @torch._dynamo.config.patch(dynamic_shapes=True)
     def test_no_raise_guard_partial_constraint_across_break(self):
@@ -4892,9 +4845,7 @@ class MiscTests(torch._dynamo.test_case.TestCase):
             return x.cos()
 
         torch._dynamo.mark_dynamic(y, 0)
-        with self.assertRaises(
-            torch._dynamo.exc.InternalTorchDynamoError,
-        ):
+        with self.assertRaises(ConstraintViolationError):
             torch._dynamo.optimize("eager")(my_dyn_fn)(y, y)
 
     def test_cannot_trace_mark_dynamic(self):
@@ -4937,35 +4888,6 @@ class MiscTests(torch._dynamo.test_case.TestCase):
             "mark_dynamic usage with dynamic_shapes=False is not yet supported",
         ):
             torch._dynamo.optimize("eager")(my_dyn_fn)(y)
-
-    @torch._dynamo.config.patch(dynamic_shapes=False)
-    def test_parameter_mark_dynamic_illegal(self):
-        y = torch.nn.Parameter(torch.tensor([0.25, 0.25]))
-        x = torch.tensor([0.5, 0.5])
-
-        class encoder(torch.nn.Module):
-            def __init__(self, y):
-                super().__init__()
-                self.register_parameter("param", y)
-
-            @torch._dynamo.disable
-            def helper(self, x, y):
-                return x * y
-
-            def forward(self, a, *args):
-                x = a + a
-                return self.helper(x, self.param)
-
-        e = encoder(y)
-        torch._dynamo.optimize("eager")(e)(x)
-        torch._dynamo.mark_dynamic(y, 0)
-        torch._dynamo.reset()
-        e = encoder(y)
-        with self.assertRaisesRegex(
-            AssertionError,
-            "mark_dynamic on parameter, parameters are always static today",
-        ):
-            torch._dynamo.optimize("eager")(e)(x)
 
     @torch._dynamo.config.patch(dynamic_shapes=True)
     def test_py_guards_mark_dynamic(self):
@@ -5020,41 +4942,6 @@ class MiscTests(torch._dynamo.test_case.TestCase):
         torch._dynamo.mark_dynamic(x, 2)
         torch._dynamo.optimize(counter)(my_dyn_fn)(x)
         self.assertEqual(counter.frame_count, 3)
-
-        # Clear dynamic
-        torch._dynamo.clear_dynamic(x, 0)
-        torch._dynamo.clear_dynamic(x, 1)
-        torch._dynamo.clear_dynamic(x, 2)
-        # Run with dynamic 0, 2, subset!
-        torch._dynamo.mark_dynamic(x, 2)
-        torch._dynamo.mark_dynamic(x, 0)
-        torch._dynamo.optimize(counter)(my_dyn_fn)(x)
-        self.assertEqual(counter.frame_count, 4)
-
-    @torch._dynamo.config.patch(dynamic_shapes=True)
-    def test_py_guards_constrain_dynamic(self):
-        x = torch.randn([7, 7, 7])
-
-        def my_dyn_fn(a):
-            if a.shape[0] > 5:
-                return a.cos()
-            return a.sin()
-
-        torch._dynamo.mark_dynamic_constrain(x, 0, min=4, max=10)
-        counter = CompileCounter()
-        torch._dynamo.optimize(counter)(my_dyn_fn)(x)
-        # First compile
-        self.assertEqual(counter.frame_count, 1)
-        # Constrain, narrowing, should not recompile
-        torch._dynamo.clear_dynamic(x, 0)
-        torch._dynamo.mark_dynamic_constrain(x, 0, min=5, max=8)
-        torch._dynamo.optimize(counter)(my_dyn_fn)(x)
-        self.assertEqual(counter.frame_count, 1)
-        torch._dynamo.clear_dynamic(x, 0)
-        # Constrain, widening, should recompile
-        torch._dynamo.mark_dynamic_constrain(x, 0, min=3, max=10)
-        torch._dynamo.optimize(counter)(my_dyn_fn)(x)
-        self.assertEqual(counter.frame_count, 2)
 
     def test_torch_compile_ctx_on_forward_and_training_step(self):
         class MyModel(torch.nn.Module):
