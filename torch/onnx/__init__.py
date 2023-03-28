@@ -33,6 +33,8 @@ from . import (  # usort:skip. Keep the order instead of sorting lexicographical
 from ._exporter_states import ExportTypes, SymbolicContext
 from ._type_utils import JitScalarType
 from .errors import CheckerError  # Backwards compatibility
+
+from .experimental.driver import ExportOutput
 from .utils import (
     _optimize_graph,
     _run_symbolic_function,
@@ -70,6 +72,8 @@ __all__ = [
     "TrainingMode",
     "TensorProtoDataType",
     "JitScalarType",
+    # Public classes
+    "ExportOutput",
     # Public functions
     "export",
     "export_to_pretty_string",
@@ -79,6 +83,7 @@ __all__ = [
     "unregister_custom_op_symbolic",
     "disable_log",
     "enable_log",
+    "flash_export",
     # Errors
     "CheckerError",  # Backwards compatibility
 ]
@@ -130,3 +135,9 @@ Args:
         character appended to the end, and flushed to output stream.
 """
 log = _C._jit_onnx_log
+
+
+def flash_export(model, *args, **kwargs) -> ExportOutput:
+    from .experimental import impl
+
+    return impl.Exporter(model).export(*args, **kwargs)
