@@ -15,6 +15,7 @@ import torch.fx
 import torch.utils._pytree as pytree
 
 from torch._dynamo import logging as dynamo_logging, utils as dynamo_utils
+from torch.multiprocessing.reductions import StorageWeakRef
 from torch._dynamo.utils import fake_mode_from_tensors
 from torch._functorch.aot_autograd import make_boxed_func
 from torch._ops import OpOverload
@@ -270,11 +271,42 @@ def align_inputs(model, inputs, static_input_idxs=()):
     if len(check_inputs) == 0:
         return model
 
+    static_input_idxs = remove_unaligned_input_idxs(inputs, static_input_idxs)
+
     def run(new_inputs):
         for i in check_inputs:
             if new_inputs[i].data_ptr() % ALIGNMENT:
+                # temporarily make sure this is not the source of the issue
+                assert False
                 new_inputs[i] = clone_preserve_strides(new_inputs[i])
-        return model(new_inputs)
+
+        import gc
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()      
+
+        static_input_data_ptrs = {new_inputs[i].untyped_storage().data_ptr() for i in static_input_idxs}
+        torch.cuda.memory._record_memory_history(False)
+        torch.cuda.memory._record_memory_history(True,
+                # keep 100,000 alloc/free events from before the snapshot
+                trace_alloc_max_entries=100000,
+
+                # record stack information for the trace events
+                trace_alloc_record_context=True)
+
+        out = model(new_inputs)
+
+        snapshot = torch.cuda.memory._snapshot()
+        trace = snapshot['device_traces'][0]
+        deallocs = set()
+
+        for event in trace:
+            if event["action"] in ("free_completed", "free_requested", "segment_free"):
+                deallocs.add(event["addr"])
+
+        assert not static_input_data_ptrs & deallocs, f"Static input data ptrs should not be deallocating {static_input_data_ptrs & deallocs}"
+
+        return out
 
     return run
 
