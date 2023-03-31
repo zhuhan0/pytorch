@@ -44,8 +44,9 @@ run_tests() {
             break
         fi
     done
-
-    if [[ $NUM_TEST_SHARDS -eq 1 ]]; then
+    if [[ "$TEST_CONFIG" = "distributed" ]]; then
+       python test/distributed/test_c10d_gloo.py -v
+    elif [[ $NUM_TEST_SHARDS -eq 1 ]]; then
         "$SCRIPT_HELPERS_DIR"/test_python_shard.bat
         "$SCRIPT_HELPERS_DIR"/test_custom_script_ops.bat
         "$SCRIPT_HELPERS_DIR"/test_custom_backend.bat
