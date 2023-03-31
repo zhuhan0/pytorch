@@ -905,6 +905,36 @@ class FakeTensor(torch.Tensor):
     def from_tensor(t, fake_mode):
         return fake_mode.from_tensor(t)
 
+    def clone_preserve_strides_storage(self):
+        # reference: MetaConverter.meta_tensor
+        with in_kernel_invocation_manager(self.fake_mode), torch.no_grad():
+            new_tensor = torch._prims.utils.clone_preserve_strides(self)
+            if self.requires_grad:
+                new_tensor.requires_grad = self.requires_grad
+                if not self.is_leaf:
+                    with torch.enable_grad():
+                        new_tensor = torch._prims.utils.clone_preserve_strides(self)
+            new_tensor.set_(
+                self.untyped_storage(),
+                self.storage_offset(),
+                self.size(),
+                self.stride(),
+            )
+        # convert meta tensor to faketensor, reference: from_meta_and_device
+        fake_tensor_converter = self.fake_mode.fake_tensor_converter
+        maybe_memo = fake_tensor_converter._get_memo(new_tensor)
+        if maybe_memo is not None:
+            return maybe_memo
+
+        # TOFIX: FakeTensor won't preserve is_leaf
+        out = FakeTensor(self.fake_mode, new_tensor, self.device, self.constant)
+        if not self.is_leaf:
+            out = out.clone()
+        if self.grad is not None:
+            out.grad = self.grad.clone_preserve_strides_storage()
+        fake_tensor_converter.set_tensor_memo(new_tensor, out)
+        return out
+
     # TODO: resolve error in default __repr__
     def __repr__(self):
         with in_kernel_invocation_manager(self.fake_mode):
