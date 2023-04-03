@@ -2581,6 +2581,7 @@ class ReproTests(torch._dynamo.test_case.TestCase):
                 self.assertTrue(same(buffer_ref, buffer_test))
 
     @torch._dynamo.config.patch("dynamic_shapes", True)
+    @torch._dynamo.config.patch("assume_static_by_default", False)
     def test_dynamic_shapes_right_side(self):
         def f(x):
             return torch.ones(5 * x.shape[0])
@@ -2676,6 +2677,7 @@ class ReproTests(torch._dynamo.test_case.TestCase):
         )
 
     @torch._dynamo.config.patch("dynamic_shapes", True)
+    @torch._dynamo.config.patch("assume_static_by_default", False)
     def test_tensor_split(self):
         def f(x):
             return torch.split(x, x.shape[0] // 2, dim=0)[0]
