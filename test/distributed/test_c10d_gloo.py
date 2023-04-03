@@ -1477,10 +1477,12 @@ class DistributedDataParallelTest(
             process_group, devices, device_ids, multi_device, gradient_as_bucket_view
         )
 
+    @skip_if_win32()
     @requires_gloo()
     def test_gloo_backend_cpu_module(self):
         self._test_gloo_backend([torch.device("cpu")], None)
 
+    @skip_if_win32()
     @requires_gloo()
     def test_gloo_backend_cpu_module_grad_is_view(self):
         self._test_gloo_backend(
@@ -2276,6 +2278,7 @@ class CommTest(test_c10d_common.AbstractCommTest, MultiProcessTestCase):
         except OSError:
             pass
 
+    @skip_if_win32()
     def _test_broadcast_coalesced(self, process_group, device, root_rank):
         half = torch.float16
 
@@ -2320,6 +2323,7 @@ class CommTest(test_c10d_common.AbstractCommTest, MultiProcessTestCase):
         for root_rank in ranks:
             self._test_broadcast_coalesced(process_group, device, root_rank)
 
+    @skip_if_win32()
     @requires_gloo()
     def test_broadcast_coalesced_gloo_cpu(self):
         store = c10d.FileStore(self.file_name, self.world_size)

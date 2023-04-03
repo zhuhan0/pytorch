@@ -32,6 +32,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.testing._internal.common_distributed import (
     MultiProcessTestCase,
     skip_if_lt_x_gpu,
+    skip_if_win32
 )
 from torch.testing._internal.common_utils import (
     TestCase,
@@ -1585,6 +1586,7 @@ class ProcessGroupWithDispatchedCollectivesTests(MultiProcessTestCase):
         except OSError:
             pass
 
+    @skip_if_win32()
     def test_init_process_group_optional_backend(self):
         with tempfile.NamedTemporaryFile() as f:
             store = dist.FileStore(f.name, self.world_size)
@@ -1597,6 +1599,7 @@ class ProcessGroupWithDispatchedCollectivesTests(MultiProcessTestCase):
                 )
                 dist.destroy_process_group()
 
+    @skip_if_win32()
     def test_init_process_group_for_all_backends(self):
         for backend in dist.Backend.backend_list:
             # skip if the backend is not available on the system
