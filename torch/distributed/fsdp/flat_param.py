@@ -1092,17 +1092,22 @@ class FlatParamHandle:
         # Invariant: `_mp_shard` is always on the compute device.
         flat_param.data = flat_param._mp_shard  # type: ignore[attr-defined]
 
-    def unshard(self):
+    def unshard(self, is_prefetch: bool):
         """
         Runs the unshard logic. This includes all-gathering the flat parameter
-        and switching to using the unsharded flat parameter. If the handle does
-        not need unsharding, then this only switches to using the unsharded
-        flat parameter. For ``NO_SHARD``, this is a no-op.
+        and switching to using the unsharded flat parameter (if not
+        prefetching). If the handle does not need unsharding, then this only
+        switches to using the unsharded flat parameter. For ``NO_SHARD``, this
+        only switches between tensor and parameter unsharded views as needed.
 
         If FSDP is in :meth:`summon_full_params` and the handle uses parameter
         mixed precision, then the parameter is forced to full precision.
         """
+        # Only switch to using the unsharded flat parameter if not prefetching
+        # to avoid doubly incurring the CPU overhead of using unsharded views
         if not self.needs_unshard():
+            if is_prefetch:
+                return
             # Even when not needing an unshard, we should switch to using
             # the unsharded flat parameter
             unsharded_flat_param = (
@@ -1114,7 +1119,8 @@ class FlatParamHandle:
             return
         unsharded_flat_param = self._alloc_padded_unsharded_flat_param()
         padded_unsharded_flat_param = self._all_gather_flat_param(unsharded_flat_param)
-        self._use_unsharded_flat_param(padded_unsharded_flat_param)
+        if not is_prefetch:
+            self._use_unsharded_flat_param(padded_unsharded_flat_param)
 
     def needs_unshard(self) -> bool:
         """Returns if the handle's flat parameter needs to be unsharded."""
