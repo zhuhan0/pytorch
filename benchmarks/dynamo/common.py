@@ -266,10 +266,8 @@ CI_SKIP[CI("inductor", training=False, dynamic=True)] = [
     # torchbench
     "functorch_dp_cifar10",  # timeout
     "opacus_cifar10",  # timeout
-    "PegasusForCausalLM",  # TypeError: Cannot convert symbols to int
-    "PegasusForConditionalGeneration",  # TypeError: Cannot convert symbols to int
     # timm_models
-    "convit_base",  # TypeError: Cannot convert symbols to int
+    "convit_base",  # _print_Pow: assert exp.is_integer
     "pnasnet5large",  # CompilationError: math.ceil
     "tf_efficientnet_b0",  # CompilationError: math.ceil
     # huggingface
