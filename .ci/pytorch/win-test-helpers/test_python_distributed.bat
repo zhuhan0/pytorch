@@ -25,7 +25,7 @@ echo Copying over test times file
 copy /Y "%PYTORCH_FINAL_PACKAGE_DIR_WIN%\.pytorch-test-times.json" "%PROJECT_DIR_WIN%"
 
 echo Run distributed tests
-python distributed/test_c10d_gloo.py  ProcessGroupGlooTest.test_sparse_allreduce_basics -v
+python distributed/test_c10d_gloo.py  -v
 if ERRORLEVEL 1 goto fail
 
 popd
