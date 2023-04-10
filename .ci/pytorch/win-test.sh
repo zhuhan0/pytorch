@@ -45,7 +45,7 @@ run_tests() {
         fi
     done
     if [[ "$TEST_CONFIG" = "distributed" ]]; then
-       python test/distributed/test_c10d_gloo.py  ProcessGroupGlooTest.test_sparse_allreduce_basics -v
+       "$SCRIPT_HELPERS_DIR"/test_python_distributed.bat
     elif [[ $NUM_TEST_SHARDS -eq 1 ]]; then
         "$SCRIPT_HELPERS_DIR"/test_python_shard.bat
         "$SCRIPT_HELPERS_DIR"/test_custom_script_ops.bat
