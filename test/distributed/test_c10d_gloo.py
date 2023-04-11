@@ -1408,6 +1408,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
         for i, tensor in enumerate(tensors):
             self.assertEqual(torch.full(size, float(i * self.world_size)), tensor)
 
+    @skip_if_win32()
     @requires_gloo()
     def test_round_robin(self):
         num_process_groups = 2
@@ -1426,6 +1427,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             pg.broadcast(tensor, root=0).wait()
             self.assertEqual(torch.full([100, 100], 0.0), tensor)
 
+    @skip_if_win32()
     @requires_gloo()
     def test_round_robin_create_destroy(self):
         store = c10d.FileStore(self.file_name, self.world_size)
@@ -1475,10 +1477,12 @@ class DistributedDataParallelTest(
             process_group, devices, device_ids, multi_device, gradient_as_bucket_view
         )
 
+    @skip_if_win32()
     @requires_gloo()
     def test_gloo_backend_cpu_module(self):
         self._test_gloo_backend([torch.device("cpu")], None)
 
+    @skip_if_win32()
     @requires_gloo()
     def test_gloo_backend_cpu_module_grad_is_view(self):
         self._test_gloo_backend(
@@ -2318,6 +2322,7 @@ class CommTest(test_c10d_common.AbstractCommTest, MultiProcessTestCase):
         for root_rank in ranks:
             self._test_broadcast_coalesced(process_group, device, root_rank)
 
+    @skip_if_win32()
     @requires_gloo()
     def test_broadcast_coalesced_gloo_cpu(self):
         store = c10d.FileStore(self.file_name, self.world_size)
