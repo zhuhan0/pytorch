@@ -442,6 +442,10 @@ if(USE_CUDA AND NOT USE_ROCM)
       CUDA::cusparse_static
       CUDA::curand_static
       CUDA::cufft_static_nocallback
+      ${CUDA_TOOLKIT_ROOT_DIR}/lib64/libcusparse_static.a
+      ${CUDA_TOOLKIT_ROOT_DIR}/lib64/libcusparseLt_static.a
+      ${CUDA_TOOLKIT_ROOT_DIR}/lib64/libcurand_static.a
+      ${CUDA_TOOLKIT_ROOT_DIR}/lib64/libcufft_static_nocallback.a
     )
    if(NOT BUILD_LAZY_CUDA_LINALG)
      if(CUDA_VERSION_MAJOR LESS_EQUAL 11)
@@ -462,6 +466,9 @@ if(USE_CUDA AND NOT USE_ROCM)
       CUDA::cusparse
       CUDA::curand
       CUDA::cufft
+      ${CUDA_cusparse_LIBRARY}
+      ${CUDA_curand_LIBRARY}
+      ${CUDA_TOOLKIT_ROOT_DIR}/lib64/libcusparseLt.so
     )
    if(NOT BUILD_LAZY_CUDA_LINALG)
      list(APPEND ATen_CUDA_DEPENDENCY_LIBS
