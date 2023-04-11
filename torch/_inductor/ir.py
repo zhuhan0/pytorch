@@ -2043,7 +2043,7 @@ class RandSeedBuffer(ConstantBuffer):
 
 class NoneAsConstantBuffer(IRNode):
     def codegen_reference(self):
-        return "None"
+        return V.graph.wrapper_code.none_str
 
 
 class ShapeAsConstantBuffer(IRNode):
@@ -2769,7 +2769,6 @@ class ExternKernelOut(ExternKernel):
             self.codegen_reference(),
             args,
             self.kernel,
-            self.cpp_kernel,
         )
 
     def __init__(
@@ -2787,11 +2786,9 @@ class ExternKernelOut(ExternKernel):
             None, layout, self.unwrap_storage(inputs), constant_args, kwargs or {}
         )
         self.output_view = output_view
-        self.cpp_kernel = cpp_kernel
-        self.ordered_kwargs_for_cpp_kernel = ordered_kwargs_for_cpp_kernel
         self.name = V.graph.register_buffer(self)
-        if kernel is not None:
-            self.kernel = kernel
+        self.kernel = cpp_kernel if V.graph.cpp_wrapper else kernel
+        self.ordered_kwargs_for_cpp_kernel = ordered_kwargs_for_cpp_kernel
 
     def should_allocate(self):
         return True
@@ -2818,12 +2815,10 @@ class ExternKernelAlloc(ExternKernel):
         super().__init__(
             None, layout, self.unwrap_storage(inputs), constant_args, kwargs or {}
         )
-        self.cpp_kernel = cpp_kernel
+        self.name = V.graph.register_buffer(self)
+        self.kernel = cpp_kernel if V.graph.cpp_wrapper else kernel
         self.ordered_kwargs_for_cpp_kernel = ordered_kwargs_for_cpp_kernel
         self.cpp_constant_args = cpp_constant_args
-        self.name = V.graph.register_buffer(self)
-        if kernel is not None:
-            self.kernel = kernel
 
     def should_allocate(self):
         return False
@@ -3439,18 +3434,21 @@ class ConvolutionBinaryInplace(ExternKernelAlloc):
 
 
 class MKLPackedLinear(ExternKernelAlloc):
-    kernel = "torch.ops.mkl._mkl_linear"
-
     def __init__(
         self,
         layout,
         inputs,
         constant_args=(),
         cpp_constant_args=(),
-        kernel="torch.ops.mkl._mkl_linear",
-        cpp_kernel="mkl::_mkl_linear",
     ):
-        super().__init__(layout, inputs, constant_args, None, kernel, cpp_kernel)
+        super().__init__(
+            layout,
+            inputs,
+            constant_args,
+            None,
+            kernel="torch.ops.mkl._mkl_linear",
+            cpp_kernel="mkl::_mkl_linear",
+        )
         self.cpp_kernel_key = "mkl_linear"
         self.cpp_op_schema = """
             at::Tensor(
@@ -3472,7 +3470,6 @@ class MKLPackedLinear(ExternKernelAlloc):
         wrapper.generate_fusion_ops_code(
             self.get_name(),
             self.kernel,
-            self.cpp_kernel,
             args,
             self.cpp_op_schema,
             self.cpp_kernel_key,
@@ -3480,8 +3477,6 @@ class MKLPackedLinear(ExternKernelAlloc):
 
     @classmethod
     def create(cls, x, packed_w, orig_w, batch_size):
-        kernel = "torch.ops.mkl._mkl_linear"
-
         x = cls.require_stride1(cls.realize_input(x))
         orig_w = cls.require_stride1(cls.realize_input(orig_w))
         *m, _ = x.get_size()
@@ -3501,23 +3496,25 @@ class MKLPackedLinear(ExternKernelAlloc):
             inputs=inputs,
             constant_args=constant_args,
             cpp_constant_args=cpp_constant_args,
-            kernel=kernel,
         )
 
 
 class LinearUnary(ExternKernelAlloc):
-    kernel = "torch.ops.mkldnn._linear_pointwise"
-
     def __init__(
         self,
         layout,
         inputs,
         constant_args=(),
-        kernel="torch.ops.mkldnn._linear_pointwise",
-        cpp_kernel="mkldnn::_linear_pointwise",
         cpp_constant_args=(),
     ):
-        super().__init__(layout, inputs, constant_args, None, kernel, cpp_kernel)
+        super().__init__(
+            layout,
+            inputs,
+            constant_args,
+            None,
+            kernel="torch.ops.mkldnn._linear_pointwise",
+            cpp_kernel="mkldnn::_linear_pointwise",
+        )
         self.cpp_kernel_key = "linear_pointwise"
         self.cpp_op_schema = """
             at::Tensor(
@@ -3540,7 +3537,6 @@ class LinearUnary(ExternKernelAlloc):
         wrapper.generate_fusion_ops_code(
             self.get_name(),
             self.kernel,
-            self.cpp_kernel,
             args,
             self.cpp_op_schema,
             self.cpp_kernel_key,
@@ -3548,7 +3544,6 @@ class LinearUnary(ExternKernelAlloc):
 
     @classmethod
     def create(cls, x, w, b, attr, scalars, algorithm):
-        kernel = "torch.ops.mkldnn._linear_pointwise"
         x = cls.require_stride1(cls.realize_input(x))
         w = cls.require_stride1(cls.realize_input(w))
 
@@ -3578,7 +3573,6 @@ class LinearUnary(ExternKernelAlloc):
             inputs=inputs,
             constant_args=constant_args,
             cpp_constant_args=cpp_constant_args,
-            kernel=kernel,
         )
 
     def apply_constraint(self):
