@@ -1316,6 +1316,7 @@ aten_native_source_non_codegen_list = [
     "aten/src/ATen/native/SummaryOps.cpp",
     "aten/src/ATen/native/TensorAdvancedIndexing.cpp",
     "aten/src/ATen/native/TensorCompare.cpp",
+    "aten/src/ATen/native/MakeDepToken.cpp",
     "aten/src/ATen/native/TensorConversions.cpp",
     "aten/src/ATen/native/TensorFactories.cpp",
     "aten/src/ATen/native/TensorIteratorReduce.cpp",
