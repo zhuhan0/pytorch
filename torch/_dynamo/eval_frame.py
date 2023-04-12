@@ -34,7 +34,6 @@ if TYPE_CHECKING:
         reset_code,
         set_eval_frame,
         set_guard_error_hook,
-        set_guard_fail_hook,
         skip_code,
         unsupported,
     )
@@ -360,9 +359,105 @@ def first_real_inst_idx(code):
     raise RuntimeError("RESUME instruction not found in code")
 
 
+# Given an installed_guard_subexpression, mutates frame_state with relevant changes.
+# Specifically, this implements the automatic dynamic frame state changes by
+# reading out which guards failed, and if the right guard for triggering
+# automatic dynamic shape expansion failed, it takes all the
+# installed_guard_subexpressions and mutates the frame_state with every dim
+# that would have failed a guard this frame.
+def compute_dynamic_expansions(
+    installed_guard_subexpression: "torch._dynamo.guards.InstalledGuardSubexpression",
+    frame_state: Dict[str, Set[int]],
+    frame,
+):
+    from torch._dynamo.source import TensorProperty, TensorPropertySource
+
+    if installed_guard_subexpression is None or not config.automatic_dynamic_shapes:
+        return
+
+    guard_scope = installed_guard_subexpression.guard_scope
+
+    def is_dynamic_source_candidate(source):
+        if isinstance(source, TensorPropertySource):
+            prop = source.prop
+            # TODO: Expand to stride?
+            if prop == TensorProperty.SIZE or prop == TensorProperty.STRIDE:
+                return True
+        return False
+
+    def is_dynamic_installed_guard_subexpression_candidate(
+        installed_guard_subexpression,
+    ):
+        if installed_guard_subexpression.origin == "SHAPE_ENV":
+            for source in installed_guard_subexpression.sources:
+                if is_dynamic_source_candidate(source):
+                    return True
+        return False
+
+    def expand_dynamic_frame_state(installed_guard_subexpression):
+        if not installed_guard_subexpression.sources:
+            # Not all code has sources! Ex: __guarded_code.valid
+            return
+        if not installed_guard_subexpression.static_value:
+            return
+        for source in installed_guard_subexpression.sources:
+            if is_dynamic_source_candidate(source):
+                name = source.name()
+                if name in frame_state:
+                    curr_value = frame_state[name]
+                    if curr_value is None:
+                        # Already dynamic
+                        continue
+                    try:
+                        new_value = eval(name, guard_scope)
+                    except:
+                        # Sadly, we need this try/catch here because eval after a failed guard is never 100% sound.
+                        # imagine if we fail a guard where a value at local named `a` went from Tensor to a Tuple.
+                        # evaling a guard like L['a'].size()[1] == 3 is nonsense, and will throw.
+                        # Until we have true trees to make guards as dependent on other guards, this stands.
+                        continue
+                    if curr_value != new_value:
+                        # Mark it dynamic
+                        frame_state[name] = None
+                        # record the base name for this dim
+                        base_name = source.base.name()
+                        if base_name not in frame_state:
+                            frame_state[base_name] = set()
+                        frame_state[base_name].add(source.idx)
+
+    installed_guard_subexpressions = installed_guard_subexpression.part_list
+    for installed_guard_subexpression in installed_guard_subexpressions:
+        # Take the failed code part, and add it as a dynamic dim
+        expand_dynamic_frame_state(installed_guard_subexpression)
+
+
 def catch_errors_wrapper(callback, hooks: Hooks):
     @functools.wraps(callback)
-    def catch_errors(frame, cache_size):
+    def catch_errors(frame, cache_size, installed_guard_subexpression, frame_state):
+        assert frame_state is not None
+
+        msg = "Compiling %s %s with cache_size %s."
+        if installed_guard_subexpression is not None:
+            torch._dynamo.guards.record_guard_failure(
+                hooks.guard_fail_fn,
+                frame.f_locals,
+                frame.f_code,
+                installed_guard_subexpression,
+            )
+            msg += " Due to guard failure %s from guard %s and source %s"
+            log.debug(
+                msg,
+                frame.f_code.co_name,
+                frame.f_code.co_filename,
+                cache_size,
+                installed_guard_subexpression.code,
+                installed_guard_subexpression.origin,
+                installed_guard_subexpression.sources,
+            )
+        else:
+            log.debug(msg, frame.f_code.co_name, frame.f_code.co_filename, cache_size)
+
+        compute_dynamic_expansions(installed_guard_subexpression, frame_state, frame)
         if (
             # TODO: the first condition is not covered by any test
             frame.f_lasti >= first_real_inst_idx(frame.f_code)
@@ -388,10 +483,10 @@ def catch_errors_wrapper(callback, hooks: Hooks):
                         ddp_optimizer.compile_fn,
                         hooks=hooks,
                     )
-                    return hijacked_callback(frame, cache_size, hooks)
+                    return hijacked_callback(frame, cache_size, hooks, frame_state)
 
         with compile_lock:
-            return callback(frame, cache_size, hooks)
+            return callback(frame, cache_size, hooks, frame_state)
 
     catch_errors._torchdynamo_orig_callable = callback  # type: ignore[attr-defined]
     return catch_errors

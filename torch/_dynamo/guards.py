@@ -1,5 +1,6 @@
 import builtins
 import collections
+import dataclasses
 import importlib
 import itertools
 import logging
@@ -25,7 +26,7 @@ from torch._guards import (
 from torch.fx.experimental.symbolic_shapes import SYMPY_INTERP
 
 from . import config, convert_frame, mutation_guard
-from .eval_frame import set_guard_error_hook, set_guard_fail_hook
+from .eval_frame import set_guard_error_hook
 from .exc import unimplemented
 from .types import GuardedCode, GuardFail, GuardFn  # noqa: F401
 from .utils import (
@@ -36,7 +37,6 @@ from .utils import (
     HAS_NUMPY,
     istype,
     np,
-    orig_code_map,
     tensor_always_has_static_shape,
     tuple_iterator_getitem,
     tuple_iterator_len,
@@ -100,11 +100,45 @@ def strip_getattr_getitem(name):
     return re.split(r"[.\[]", name)[0]
 
 
+@dataclasses.dataclass
+class InstalledGuardSubexpression:
+    """
+    A InstalledGuardSubexpression represents a code string and bookkeeping
+    information accumulated at guard creation time.
+    InstalledGuardSubexpressions are used to make up the check_fn we use for
+    guards. A collection of InstalledGuardSubexpressions is kept on each guard
+    cache entry, and is passed into the subsequent eval_frame callback upon
+    guard failure.
+
+    Note: This object's uniqueness is dictated by the code str. For a given
+    code str, all other parts must be identical.
+    """
+
+    sources: Optional[
+        List[Source]
+    ]  # Note: List of sources for tensor checks and shape_env
+    code: str
+    origin: str
+    static_value: Optional[int]
+
+    part_list: List["InstalledGuardSubexpression"] = None
+
+    # tensor check only
+    check_tensor_verbose = None
+    tensor_check_names: Optional[str] = None
+
+    def __hash__(self):
+        return hash(self.code)
+
+    def __eq__(self, other):
+        return self.code == other.code
+
+
 class GuardBuilder(GuardBuilderBase):
     def __init__(
         self,
         id_ref: Callable[[Type[object]], str],
-        source_ref: Callable[[Source], str],
+        source_ref: Callable[[Source, List[Source]], str],
         user_scope: Optional[Dict[str, object]],
         check_fn_manager: "CheckFunctionManager",
         *,
@@ -130,12 +164,12 @@ class GuardBuilder(GuardBuilderBase):
 
         self.argnames: List[str] = []
         # Code is python expression strings generated for each guard
-        self.code: List[str] = []
+        self.code: List[InstalledGuardSubexpression] = []
         # shape_env_code is only used by local_builder and is used for
         # shape env code.  This exists only because we need to make sure
         # shape env guards get run after tensor match guards (since the
         # tensor match guards make sure we actually have tensors)
-        self.shape_env_code: List[str] = []
+        self.shape_env_code: List[InstalledGuardSubexpression] = []
 
         # [Note - On Eager Tensor Guards]
         # Most of the time, we generate Python code in a guard to directly
@@ -150,6 +184,7 @@ class GuardBuilder(GuardBuilderBase):
         # swept up into a single call to ___check_tensors.  Invariant:
         # len(tensor_check_names) == len(tensor_check_examples).
         self.tensor_check_names: List[str] = []
+        self.tensor_check_sources: List[Source] = []
         self.tensor_check_examples: List[torch.Tensor] = []
 
         self.check_fn_manager: CheckFunctionManager = check_fn_manager
@@ -337,13 +372,10 @@ class GuardBuilder(GuardBuilderBase):
         ref = self.arg_ref(guard)
         val = self.get(guard.name)
 
-        def setup_guard():
-            assert istype(val.training, bool)
-            self.code.append(f"{ref}.training == {val.training}")
-
         if hasattr(val, "training"):
             # There are cases where a monkeypatched object has a guard made between __new__ and __init__
-            setup_guard()
+            assert istype(val.training, bool)
+            self._produce_guard_code(guard, [f"{ref}.training == {val.training}"])
         else:
             unimplemented(f"Guard setup for uninitialized class {type(val)}")
 
@@ -464,8 +496,15 @@ class GuardBuilder(GuardBuilderBase):
             constraint_inputs=constraint_inputs,
             source_ref=self.source_ref,
         )
+        origin = guard.origin
         for shape_guard in guards:
-            self._produce_guard_code(guard, [shape_guard], shape_env=True)
+            self._produce_guard_code(
+                guard,
+                [shape_guard.expr],
+                shape_env=True,
+                sources=shape_guard.sources,
+                static_value=shape_guard.static_value,
+            )
 
     def TENSOR_MATCH(self, guard: Guard):
         if guard.is_nn_module():
@@ -515,35 +554,50 @@ class GuardBuilder(GuardBuilderBase):
                     code.append(f"{tensor_name}.{term} == {real_value}")
             else:
                 self.tensor_check_names.append(tensor_name)
+                self.tensor_check_sources.append(guard.origin)
                 self.tensor_check_examples.append(value)
 
-            # A frame is valid for reuse with dynamic dimensions if the new dynamic dimensions are a
-            # strict subset of the old.
+            # Let’s go over the whole algorithm here.
+            # 1) At a very high level, we accumulate guards into InstalledGuardSubexpression objects,
+            # which have origin sources, a string code expression, and various other bookkeeping fields. For example,
+            # ShapeEnv, when asked to produce_guards, emits structures with a static_value if the guard was known to
+            # be narrowed down to a single static value, such as in the case of assume_static_by_default initial
+            # compile. This is written to the relevant InstalledGuardSubexpression.
             #
-            # The logic here is as follows:
+            # 2) We iterate over all InstalledGuardSubexpressions accumulated to produce the guard make_fn, which in
+            # turn is executed to compile the check_fn that gets installed on the frame cache entry. The generated
+            # code produces a set of `if` statements, where roughly each if looks like:
+            # ```
+            # if subexpression == False:
+            #      return False, __fail(subexpr_id)
+            # ```
             #
-            # Every mark_dynamic directive is a user-knows-best command, which can incur a raise at tracing
-            # time if we find guards that run counter to the user directive.
-            # If compiling a frame with explicit dynamic dims X could cause an exception, we MUST NOT skip compiling.
+            # At the same time, any guards with a static_value associated are written to the frame_state
+            # (a per frame bound object), with their SHAPE ENV SOURCE and value.
+            # Ex:
+            # {L[‘x’].size()[0] : 2}
             #
-            # If the frame is compiled with any marked dynamic indices, let's call that set of indices X.
-            # When we evaluated inputs against the guards, given the same tensor with potentially new dynamic indices,
-            # let's call that set Y.
+            # 3) In the above, the __fail() function, given a subexpression id, looks it up from the list of parts
+            # used to produce this check_fn. It then passes that information, through the frame interpreter in
+            # eval_frame.c, into our next frame interpretation callback.
             #
-            # When X is a strict subset of Y, the potential new raises introduced during compilation are a strict subset
-            # of the raises we
-            # could have encountered. The frame compiled under Y is safe to reuse with X.
-            # When X is not a strict subset of Y, the non-overlapping new elements of X may cause new raises, and the
-            # frame is no longer fit for reuse.
-            #
-            # This is the case because any newly introduced mark_dynamic directives have a chance of
-            # raising, failing compilation. Any existing mark_dynamic indices that we lost are safe to lose
-            # as all it means is that we have gotten rid of a user directive which could incur a raise at compile time.
-            # In the case of when there is no Y, that is, there are no dynamic indices marked at all, the frame is safe
-            # to reuse
-            # as an empty set is a safe degeneration - that is, a strictly static tensor is always valid for a frame
-            # compiled with that same
-            # tensor + more onerous user directives.
+            # 4) Within the frame interpretation callback, if any guard fails, and we are in the automatic_dynamic
+            # regime, we iterate over all subexpressions within this check_fn, and extract any that have changed.
+
+            # We do this by parsing out the sources from all valid subexpressions in the check_fn, and then
+            # evaluating their new value against the old value.
+
+            # If the value changed, we know that the rev was:a) In a dynamic dim marked as static
+            # b) a candidate for being expanded into automatic dynamic
+
+            # So, we do that in two steps. First, we mark it as ‘None’ for the source:{L[‘x’].size()[0] : None}
+
+            # This indicates that we’ve seen it already, and know it to be dynamic.
+
+            # Next, we extract the base name, and record the dynamic dim for it:
+
+            # {L[‘x’]: {0})5) When we go to apply our policy to the shape_env in this frame, we look up the tensor
+            # source’s name (L[‘x’]) and check if there is a policy decision to be made w/r/t automatic dynamic shapes.
             assert guard.source is not None
             static, reason = tensor_always_has_static_shape(value, is_tensor=True)
             if not static:
@@ -563,7 +617,13 @@ class GuardBuilder(GuardBuilderBase):
 
     # A util that appends guarded code, or, in the case of export, adds data onto guards
     def _produce_guard_code(
-        self, guard, code_list, provided_guarded_object=None, shape_env=False
+        self,
+        guard,
+        code_list,
+        provided_guarded_object=None,
+        shape_env=False,
+        sources=None,
+        static_value=None,
     ):
         # WARNING: It is important that cur_frame/caller do NOT stay in
         # the current frame, because they will keep things live longer
@@ -574,16 +634,22 @@ class GuardBuilder(GuardBuilderBase):
         del cur_frame
         assert caller is not None
         func_name = getframeinfo(caller)[2]
-        del caller
         # We use func_name for export, so might as well get a nice defensive check out of it
         assert func_name in dir(
             self.__class__
         ), f"_produce_guard_code must be called from inside GuardedCode. Called from {func_name}"
 
-        if shape_env:
-            self.shape_env_code.extend(code_list)
-        else:
-            self.code.extend(code_list)
+        del caller
+        for code in code_list:
+            if sources is None:
+                sources = [guard.origin]
+            installed_guard_subexpression = InstalledGuardSubexpression(
+                sources, code, func_name, static_value
+            )
+            if shape_env:
+                self.shape_env_code.append(installed_guard_subexpression)
+            else:
+                self.code.append(installed_guard_subexpression)
 
         # Not all guards have names, some can be installed globally (see asserts on HAS_GRAD)
         if provided_guarded_object is None:
@@ -642,7 +708,8 @@ class CheckFunctionManager:
 
             return {**left, **right}
 
-        def source_ref(source):
+        def source_ref(source, source_list):
+            source_list.append(source)
             guard_source = source.guard_source()
             if guard_source is GuardSource.CONSTANT:
                 # No need to track constants
@@ -695,20 +762,27 @@ class CheckFunctionManager:
         largs += ["**___kwargs_ignored"]
         args = ",".join(largs)
 
-        code_parts = (
-            ["___guarded_code.valid"] + local_builder.code + global_builder.code
+        validation_installed_guard_subexpression = InstalledGuardSubexpression(
+            None,
+            "___guarded_code.valid",
+            "",
+            static_value=None,
         )
-        # TODO(whc) maybe only the 'check_tensors' one is ambiguous? if so we can be less general..
-        verbose_code_parts = (
-            ["___guarded_code.valid"] + local_builder.code + global_builder.code
-        )
+        installed_guard_subexpressions = []
+        installed_guard_subexpressions.append(validation_installed_guard_subexpression)
+        installed_guard_subexpressions += local_builder.code + global_builder.code
+        part_list: List[InstalledGuardSubexpression] = []
 
         tensor_check_names = (
             local_builder.tensor_check_names + global_builder.tensor_check_names
         )
+        tensor_check_sources = (
+            local_builder.tensor_check_sources + global_builder.tensor_check_sources
+        )
+        assert len(tensor_check_names) == len(tensor_check_sources)
 
         check_tensors_fn = None
-        check_tensors_verbose_fn = None
+        check_tensor_verbose = None
         if tensor_check_names:
             assert (
                 not self.output_graph.export
@@ -721,12 +795,17 @@ class CheckFunctionManager:
                 *tensor_check_examples, dynamic_shapes=config.dynamic_shapes
             )
             check_tensors_fn = tensor_guards.check
-            check_tensors_verbose_fn = tensor_guards.check_verbose
-            code_parts.append(f"___check_tensors({', '.join(tensor_check_names)})")
-            verbose_args = ", ".join(
-                tensor_check_names + ["tensor_check_names=tensor_check_names"]
+            check_tensor_names = ", ".join(tensor_check_names)
+            check_tensor_func_str = f"___check_tensors({check_tensor_names})"
+            installed_guard_subexpression = InstalledGuardSubexpression(
+                tensor_check_sources,
+                check_tensor_func_str,
+                "TENSOR_MATCH",
+                static_value=None,
             )
-            verbose_code_parts.append(f"___check_tensors_verbose({verbose_args})")
+            check_tensor_verbose = tensor_guards.check_verbose
+            installed_guard_subexpression.tensor_check_names = tensor_check_names
+            installed_guard_subexpressions.append(installed_guard_subexpression)
 
         aotautograd_guards: List[GuardEnvExpr] = (
             self.output_graph.tracing_context.guards_context.aotautograd_guards
@@ -737,45 +816,81 @@ class CheckFunctionManager:
             if isinstance(guard, DuplicateInputs):
                 source_a = guard.input_source_a
                 source_b = guard.input_source_b
-                code_part = f"{source_a.name()} is {source_b.name()}"
-                code_parts.append(code_part)
-                verbose_code_parts.append(code_part)
+                installed_guard_subexpression = InstalledGuardSubexpression(
+                    [source_a, source_b],
+                    f"{source_a.name()} is {source_b.name()}",
+                    "DuplicateInputs",
+                    static_value=None,
+                )
+                installed_guard_subexpressions.append(installed_guard_subexpression)
             else:
                 raise RuntimeError(f"Unknown GuardEnvExpr: {guard}")
 
-        code_parts.extend(local_builder.shape_env_code)
-        verbose_code_parts.extend(local_builder.shape_env_code)
+        installed_guard_subexpressions.extend(local_builder.shape_env_code)
         assert not global_builder.shape_env_code
 
-        code = " and ".join(unique(code_parts))
         closure_vars = collections.OrderedDict(
             [
                 ("___guarded_code", self),
                 ("___check_tensors", check_tensors_fn),
-                ("___check_tensors_verbose", check_tensors_verbose_fn),
+                ("___check_tensors_verbose", check_tensor_verbose),
                 ("tensor_check_names", tensor_check_names),
+                ("part_list", part_list),
             ]
             + list(SYMPY_INTERP.items())
         )
         closure_vars.update(CLOSURE_VARS)
-        py_code = f"""\
-def ___make_guard_fn({','.join(closure_vars.keys())}):
-    return lambda L: {code}
-"""
+
+        # Let's go over how this code works.
+        #
+        # 1) The cache entry structure in eval_frame.c is stored in the frame's extra
+        # field. Each cache_entry is a node in a linked list. Each cache entry represents
+        # a compiled frame with specializations. In order to know if a cache entry's
+        # compiled frame is valid for reuse, we need to invoke a function, check_fn, to
+        # compare current state against the specializations captured at compile time.
+        #
+        # 2) The function, check_fn, mentioned above, is defined by executing the
+        # function below, ___make_guard_fn
+        #
+        # 3) In this, this code is rather confusing, because it defines both
+        # ___make_guard_fn and the lambda it produces which becomes the check_fn.
+        #
+        # 4) Everything in code becomes the check_fn. We write it out by first
+        # defining a __fail, which given a installed_guard_subexpression_idx, the index
+        # of a installed_guard_subexpression, extract a installed_guard_subexpression
+        # from the part_list and binds a scope to it. This is used later for evaluating
+        # the expression defined in installed_guard_subexpression, if necessary.
+        # __fail is invoked if a specific sub expression of a guard is failed.
+        #
+        # 5) The sub expressions of guards are defined 1 per installed_guard_subexpression.
+        # We iterate over the installed_guard_subexpressions and produce a function that
+        # evaluates the code and if it is False, returns __fail(installed_guard_subexpression_idx),
+        # or if passing, proceeds until we've run all the sub expressions through.
+        # 6) In the event that we re-enter frame evaluation having failed a guard, we
+        # return the installed_guard_subexpression and pass it through to the frame
+        # evaluation callback. This is where downstream systems that handle guard
+        # failures hook in, like guard failure logging, or converting static shape
+        # failures to dynamic shapes (if the config is set).
+        py_code = make_guard_fn(
+            installed_guard_subexpressions,
+            closure_vars,
+            part_list,
+            self.output_graph.frame_state if self.output_graph else {},
+        )
         if os.environ.get("TORCHDYNAMO_PRINT_GUARDS", None) == "1":
-            print("GUARDS", code)
-        set_guard_fail_hook(guard_fail_hook)
+            print("GUARDS", py_code)
         out: Dict[str, Any] = dict()
         exec(py_code, global_builder.scope, out)
         guard_fn = out["___make_guard_fn"](*closure_vars.values())
         guard_fn.closure_vars = closure_vars
-        # TODO(whc) maybe '.code_parts' was only kept around for the guard callback? so we don't need both
+        # TODO(whc) maybe '.installed_guard_subexpressions' was only kept around for the guard callback? so we don't
+        # need both
         guard_fn.args = largs
-        guard_fn.code_parts = code_parts
-        guard_fn.verbose_code_parts = verbose_code_parts
+        guard_fn.installed_guard_subexpressions = installed_guard_subexpressions
         # Grab only G, but preserve "G" because guards access it as "G"
         guard_fn.global_scope = {"G": global_builder.scope["G"]}
         guard_fn.guard_fail_fn = guard_fail_fn
+        guard_fn.part_list = part_list
         return guard_fn
 
     def invalidate(self, ref):
@@ -793,65 +908,31 @@ def ___make_guard_fn({','.join(closure_vars.keys())}):
         return id(obj)
 
 
-stashed_first_fail_reason = None
-
-
-def guard_fail_hook(
-    guard_fn: GuardFn,
-    code: types.CodeType,
-    f_locals: Dict[str, object],
-    index: int,
-    last: bool,
-) -> None:
+def record_guard_failure(
+    guard_fail_fn,
+    f_locals,
+    code,
+    installed_guard_subexpression: InstalledGuardSubexpression,
+) -> str:
     """
     called whenever a guard fails.
     """
-    first = index == 0
-    global stashed_first_fail_reason
-    # Don't waste time computing the fail reason for guards we aren't going to report out.
-    if not guard_fn.guard_fail_fn and not (first or last):
-        return
-    scope = {"L": f_locals, "G": guard_fn.global_scope["G"]}
-    scope.update(guard_fn.closure_vars)
-    reason = None
-    for part in guard_fn.verbose_code_parts:
-        fail_reason = eval(part, guard_fn.global_scope, scope)
-        # TODO(whc) hacky for now as not every 'part' in guard_fn.verbose_code_parts
-        # is updated to return a string explaining the failure.
-        if isinstance(fail_reason, str):
-            reason = fail_reason
-            break
-        elif isinstance(fail_reason, bool) and not fail_reason:
-            reason = part
-            break
-
-    if first:
-        stashed_first_fail_reason = reason
-
-    if not last:
-        return
-
-    # Technically, we're failing our last guard, which is our oldest guard due to the
-    # eval_frame.c logic that moves newest frames to head, but for logging purposes
-    # it's more useful to see the 'first' failure (if we never got a hit) since it's
-    # likely not yet been logged as a failure reason in a case of repeating failures.
-    assert stashed_first_fail_reason
-    guard_failures[orig_code_map[code]].append(stashed_first_fail_reason)
-    stashed_first_fail_reason = None
-
-    # TODO should we GuardFail our stashed_first_fail_reason too?
-    try:
-        if guard_fn.guard_fail_fn is not None:
-            guard_fn.guard_fail_fn(
-                GuardFail(reason or "unknown reason", orig_code_map[code])
-            )
-    except Exception as e:
-        log.error(
-            "Failure in guard_fail_fn callback - raising here will cause a NULL Error on guard eval",
-            exc_info=True,
+    reason = installed_guard_subexpression.code
+    if "__check_tensors" in reason:
+        assert installed_guard_subexpression.tensor_check_names is not None
+        reason = eval(
+            f"___check_tensors_verbose({', '.join(installed_guard_subexpression.tensor_check_names)}, tensor_check_names={installed_guard_subexpression.tensor_check_names})",  # noqa: B950
+            installed_guard_subexpression.guard_scope,
         )
+    guard_failures[code].append(reason)
+    if guard_fail_fn:
+        guard_fail_fn(GuardFail(reason, code))
+
+    return reason
 
 
+# TODO(voz): Rewrite this API, we don't use most of these,
+# leftover from when we had 2 fns.
 def guard_error_hook(
     guard_fn: GuardFn,
     code: types.CodeType,
@@ -866,11 +947,68 @@ def guard_error_hook(
     # column number of which subexpression failed.  But that would also
     # require us to have the TRUE code that was eval'ed, not a shoddy
     # reconstruction (like is done here)
-    print("lambda " + ", ".join(guard_fn.args) + ":")
-    print(" ", " and\n  ".join(guard_fn.code_parts))
+    print(make_guard_fn(guard_fn.installed_guard_subexpressions, {}, [], {}))
 
 
 set_guard_error_hook(guard_error_hook)
+
+
+def make_guard_fn(installed_guard_subexpressions, closure_vars, part_list, frame_state):
+    # TODO(voz): Move this somewhere more general so we don't have to violate heirarchy?
+    from torch._inductor.utils import IndentedBuffer
+
+    make_fail_buf = IndentedBuffer()
+    make_fail_buf.writeline("def __fail(installed_guard_subexpression_idx):")
+    with make_fail_buf.indent():
+        make_fail_buf.writeline(
+            "installed_guard_subexpression = part_list[installed_guard_subexpression_idx]"
+        )
+        # This line is awful. It does some really gross scope binding so that eval into `L` dict
+        # can work on the given source.name()
+        #
+        # Alternative impls:
+        #  1) regex to strip L out of name (brittle)
+        #  2) give every source a .local_name matching the heirarchy of .name, but without the L/G access.
+        make_fail_buf.writeline("installed_guard_subexpression.guard_scope = {'L': L} ")
+        for key, value in closure_vars.items():
+            if callable(value):
+                make_fail_buf.writeline(
+                    f"installed_guard_subexpression.guard_scope['{key}'] = {key}"
+                )
+        make_fail_buf.writeline("return installed_guard_subexpression")
+
+    assert len(part_list) == 0
+
+    code_buf = IndentedBuffer()
+    unique_installed_guard_subexpressions = unique(installed_guard_subexpressions)
+    for i, installed_guard_subexpression in enumerate(
+        unique_installed_guard_subexpressions
+    ):
+        installed_guard_subexpression.part_list = part_list
+        if installed_guard_subexpression.static_value:
+            for source in installed_guard_subexpression.sources:
+                name = source.name()
+                if name not in frame_state:
+                    frame_state[name] = installed_guard_subexpression.static_value
+        part_list.append(installed_guard_subexpression)
+        code_buf.writeline(f"if ({installed_guard_subexpression.code}) == False:")
+        with code_buf.indent():
+            code_buf.writeline(f"return (False, __fail({i}))")
+
+    code_buf.writeline("return (True, None)")
+
+    make_guard_fn_buf = IndentedBuffer()
+    make_guard_fn_buf.writeline(
+        f"def ___make_guard_fn({','.join(closure_vars.keys())}):"
+    )
+    with make_guard_fn_buf.indent():
+        make_guard_fn_buf.writeline("def guard_fn(L):")
+        with make_guard_fn_buf.indent():
+            make_guard_fn_buf.splice(make_fail_buf)
+            make_guard_fn_buf.splice(code_buf)
+        make_guard_fn_buf.writeline("return guard_fn")
+
+    return make_guard_fn_buf.getvalue()
 
 
 def unique(seq):
