@@ -2951,6 +2951,27 @@ class ReproTests(torch._dynamo.test_case.TestCase):
 
         self.assertEqual(f(), _GLOBAL_CPU_TENSOR + _GLOBAL_CPU_TENSOR)
 
+    def test_constant_variable_reconstruction(self):
+        import logging
+        import os
+        from torch._dynamo.comptime import comptime
+
+        prev_log_level = torch._dynamo.config.log_level
+        torch._dynamo.config.log_level = logging.DEBUG
+
+        os.environ["TORCH_COMPILE_DEBUG"] = "1"
+
+        @torch._dynamo.optimize("eager")
+        def h():
+            x = set()
+            comptime.graph_break()
+            x.add(1)
+            return x
+
+        print(h())
+
+        del os.environ["TORCH_COMPILE_DEBUG"]
+        torch._dynamo.config.log_level = prev_log_level
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
