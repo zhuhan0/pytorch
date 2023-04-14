@@ -2953,13 +2953,11 @@ class ReproTests(torch._dynamo.test_case.TestCase):
 
     def test_constant_variable_reconstruction(self):
         import logging
-        import os
+
         from torch._dynamo.comptime import comptime
 
-        prev_log_level = torch._dynamo.config.log_level
-        torch._dynamo.config.log_level = logging.DEBUG
-
-        os.environ["TORCH_COMPILE_DEBUG"] = "1"
+        torch._logging.set_logs(dynamo=logging.DEBUG)
+        torch._dynamo.config.verbose = True
 
         @torch._dynamo.optimize("eager")
         def h():
@@ -2968,10 +2966,8 @@ class ReproTests(torch._dynamo.test_case.TestCase):
             x.add(1)
             return x
 
-        print(h())
+        h()
 
-        del os.environ["TORCH_COMPILE_DEBUG"]
-        torch._dynamo.config.log_level = prev_log_level
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
