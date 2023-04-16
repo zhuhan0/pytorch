@@ -44,7 +44,7 @@ else:
             continue
         globals()[name] = getattr(torch._C._dynamo.eval_frame, name)
 
-from . import config, convert_frame, skipfiles, utils
+from . import config, convert_frame, external_utils, skipfiles, utils
 from .exc import ResetRequired
 from .mutation_guard import install_generation_tagging_init
 from .types import DynamoCallback
@@ -83,30 +83,42 @@ class OptimizedModule(torch.nn.Module):
     forward method to optimized self.forward method.
     """
 
-    def __init__(self, mod, dynamo_ctx):
+    def __init__(self, mod: torch.nn.Module, dynamo_ctx):
         super().__init__()
         # Installs the params/buffer
         self._orig_mod = mod
         self.dynamo_ctx = dynamo_ctx
+
+        # do this stuff in constructor to lower overhead slightly
+        if isinstance(self._orig_mod.forward, types.MethodType) and skipfiles.check(
+            inspect.getsourcefile(self._orig_mod.forward)
+        ):
+            # this is likely a torch.nn.* instance in skipfiles.py
+            # workaround to add an extra frame we can capture
+            self.forward = self.dynamo_ctx(external_utils.wrap_inline(mod))
+        else:
+            # Invoke hooks outside of dynamo then pickup the inner frame
+            self.forward = self.dynamo_ctx(mod.__call__)
+
+        # these are needed for some tests to work
+        self.named_parameters = mod.named_parameters
+        self.named_buffers = mod.named_buffers
+
+        if hasattr(mod, "_initialize_hook"):
+            self.__call__ = self._call_lazy_check
+
+    def __getstate__(self):
+        return (self._orig_mod, self.dynamo_ctx)
+
+    def __setstate__(self, state):
+        self.__init__(*state)  # type: ignore[misc]
 
     def __getattr__(self, name):
         if name == "_orig_mod":
             return self._modules["_orig_mod"]
         return getattr(self._orig_mod, name)
 
-    def __setattr__(self, name, value):
-        if name == "forward":
-            log.warning(
-                "Modifying OptimizedModule.forward may not do what you expect. "
-                "Most usage of OptimizedModule routes through __call__, which will never call OptimizedModule.forward. "
-                "Instead, OptimizedModule.__call__ will invoke a compiled version of the wrapped module's __call__. "
-                "OptimizedModule.forward is provided only as an escape hatch for invoking the compiled wrapped module "
-                "forward method without __call__ (and thus bypassing module hooks). "
-                "To alter the behavior of the wrapped module, modify its forward before compilation. "
-            )
-        super().__setattr__(name, value)
-
-    def __call__(self, *args, **kwargs):
+    def _call_lazy_check(self, *args, **kwargs):
         if hasattr(self._orig_mod, "_initialize_hook"):
             # In the case of a lazy module, we want to run
             # the pre-hooks which initialize it.
@@ -114,14 +126,7 @@ class OptimizedModule(torch.nn.Module):
             # to avoid treating it as lazy on subsequent recompile.
             assert len(kwargs) == 0
             self._orig_mod._infer_parameters(self._orig_mod, args)
-        return self.dynamo_ctx(self._orig_mod.__call__)(*args, **kwargs)
-
-    def forward(self, *args, **kwargs):
-        log.warning(
-            "Calling OptimizedModule.forward will compile/execute wrapped model forward without running module hooks. "
-            "Usually, you should invoke OptimizedModule.__call__ instead, which follows pytorch module behavior."
-        )
-        return self.dynamo_ctx(self._orig_mod.forward)(*args, **kwargs)
+        return super().__call__(*args, **kwargs)
 
 
 def remove_from_cache(f):
@@ -222,8 +227,17 @@ class _TorchDynamoContext:
             # of decorators.
             new_mod._torchdynamo_orig_callable = mod.forward
             return new_mod
-
         assert callable(fn)
+
+        try:
+            filename = inspect.getsourcefile(fn)
+        except TypeError:
+            filename = None
+        if (filename is None or skipfiles.check(filename)) and (
+            getattr(fn, "__name__", "") != "_call_impl"
+        ):
+            # call to a builtin without a frame for us to capture
+            fn = external_utils.wrap_inline(fn)
 
         callback = self.callback
         on_enter = self.on_enter
