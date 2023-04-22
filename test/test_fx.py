@@ -36,7 +36,7 @@ from copy import deepcopy
 from collections import namedtuple
 
 from torch.fx.proxy import TraceError
-from torch.fx._compatibility import _BACK_COMPAT_OBJECTS, _MARKED_WITH_COMATIBLITY
+from torch.fx._compatibility import _BACK_COMPAT_OBJECTS, _MARKED_WITH_COMPATIBILITY
 
 from fx.test_subgraph_rewriter import TestSubgraphRewriter  # noqa: F401
 from fx.test_dce_pass import TestDCE  # noqa: F401
@@ -2317,6 +2317,88 @@ class TestFX(JitTestCase):
         x, y = torch.randn(3, 4), torch.randn(3, 4)
         self.checkGraphModule(foo, (x, y))
 
+
+    def test_trace_return_dataclass(self):
+        """
+        Test case for Module that return dataclass
+        """
+        from dataclasses import dataclass
+
+        @dataclass
+        class MyOutput:
+            foo: torch.Tensor
+            bar: torch.Tensor
+
+        class ModuleReturnDataclass(torch.nn.Module):
+            def forward(self, d : torch.Tensor):
+                return MyOutput(foo=d + d, bar=d * 3)
+
+        module = ModuleReturnDataclass()
+        traced_graph = symbolic_trace(module).graph
+        print(traced_graph)
+
+        gm = GraphModule(module, traced_graph)
+        x = torch.rand(1)
+
+        self.assertEqual(module(x), gm(x))
+
+    def test_trace_return_dataclass_nested(self):
+        """
+        Test case for Module that return dataclass
+        """
+        from dataclasses import dataclass
+
+        @dataclass
+        class MyOutput:
+            foo: torch.Tensor
+            bar: torch.Tensor
+
+        class ModuleReturnDataclass(torch.nn.Module):
+            def forward(self, d : torch.Tensor):
+                return MyOutput(foo=d + d, bar=d * 3)
+
+        class CallsModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.m = ModuleReturnDataclass()
+
+            def forward(self, x):
+                tmp = self.m(x)
+                return MyOutput(foo=tmp.foo, bar=tmp.bar)
+
+        module = CallsModule()
+        traced_graph = symbolic_trace(module).graph
+        print(traced_graph)
+
+        gm = GraphModule(module, traced_graph)
+        x = torch.rand(1)
+
+        self.assertEqual(module(x), gm(x))
+
+
+    def test_trace_return_namedtuple(self):
+        """
+        Test case for Module that return namedtuple
+        """
+        class MyOutput(NamedTuple):
+            foo: torch.Tensor
+            bar: torch.Tensor
+
+        class ModuleReturnNamedTuple(torch.nn.Module):
+            def forward(self, d : torch.Tensor):
+                return MyOutput(foo=d, bar=d)
+
+
+        module = ModuleReturnNamedTuple()
+
+        traced_graph = symbolic_trace(module).graph
+        print(traced_graph)
+
+        gm = GraphModule(module, traced_graph)
+        x = torch.rand(1)
+
+        self.assertEqual(module(x), gm(x))
+
     def test_trace_dict_int_keys(self):
         class ModWithDictArg(torch.nn.Module):
             def forward(self, d : Dict[int, torch.Tensor]):
@@ -3883,7 +3965,7 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
                 if isinstance(v, types.ModuleType):
                     check_symbols_have_bc_designation(v, prefix + [k])
                 elif isinstance(v, (type, types.FunctionType)):
-                    if v not in _MARKED_WITH_COMATIBLITY:
+                    if v not in _MARKED_WITH_COMPATIBILITY:
                         non_back_compat_objects.setdefault(v)
 
         check_symbols_have_bc_designation(torch.fx, ['torch', 'fx'])
