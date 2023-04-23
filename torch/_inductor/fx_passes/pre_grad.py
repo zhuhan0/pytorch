@@ -54,6 +54,7 @@ def pre_grad_passes(gm, example_inputs):
         lazy_init()
         gm = fuse_fx(gm, example_inputs)
         patterns.apply(gm.graph)
+        gm = overrides.fuse_quantization(gm, example_inputs)
 
     gm.graph.lint()
     gm.recompile()
