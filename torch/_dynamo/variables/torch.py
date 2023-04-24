@@ -832,7 +832,7 @@ class TorchHigherOrderOperator(VariableTracker):
                 )
             )
 
-        def speculate_subgraph(f, sub_args, graph_checkpoint, checkpoint):
+        def speculate_subgraph_old(f, sub_args, graph_checkpoint, checkpoint):
             if isinstance(f, NestedUserFunctionVariable) and f.closure is not None:
                 # closure vars other than 'self' are not in scope of generated code, so error early
                 # TODO(avik): we should eventually support this.
@@ -876,7 +876,12 @@ class TorchHigherOrderOperator(VariableTracker):
             # Register output to graph
             # Modeled off of compile_and_call_fx_graph
             # TODO: support non single Tensor output
-            assert isinstance(output, TensorVariable)
+            if not isinstance(output, TensorVariable):
+                raise ArgsMismatchError(
+                    "Expected branch out type to be a single tensor but got {}".format(
+                        str(output.python_type())
+                    ),
+                )
             tx.output.guards.update(output.guards)
             tx.output.create_node(
                 "output", "output", (tx.output.create_arg((output.as_proxy(),))), {}
@@ -899,7 +904,67 @@ class TorchHigherOrderOperator(VariableTracker):
                 guards,
                 nn_modules,
                 comparable_state,
+                None,
             )
+
+
+        def speculate_subgraph(f, sub_args, graph_checkpoint, checkpoint):
+            try:
+                # Setup the subgraph we're going to capture into
+                original_output = tx.output
+                tx.output = original_output.new_subgraph()
+
+                args = []
+                # One argument to graph per sub_args
+                for a in sub_args:
+                    if isinstance(a, TensorVariable):
+                        tx.output.create_graph_input(a.as_proxy().node.name, recurse=False)
+                        args.append(a)
+                    else:
+                        # call_function() needs a TensorVariable, therefore we construct
+                        # one with inner graph proxy.
+                        assert isinstance(a, torch.Tensor)
+                        proxy = tx.output.create_graph_input("arg", recurse=False)
+                        args.append(wrap_fx_proxy(tx=tx, proxy=proxy, example_value=a))
+                    # NB: we don't bother populating graphargs, as
+                    # they won't actually get used by anything
+
+                output = f.call_function(tx, args, {})
+
+                # Register output to graph
+                # Modeled off of compile_and_call_fx_graph
+                # TODO: support non single Tensor output
+                assert isinstance(output, TensorVariable)
+                tx.output.guards.update(output.guards)
+                tx.output.create_node(
+                    "output", "output", (tx.output.create_arg((output.as_proxy(),))), {}
+                )
+
+                tx.output.side_effects.prune_dead_object_new(tx)
+                state = tx.copy_graphstate()
+
+                guards = state.output.guards
+                nn_modules = state.output.nn_modules
+
+                comparable_state = get_comparable_state(state)
+                graph = tx.output.graph
+                lifted_freevars = tx.output.freevars
+
+                tx.output = original_output
+
+                return (
+                    output,
+                    graph,
+                    guards,
+                    nn_modules,
+                    comparable_state,
+                    lifted_freevars,
+                )
+            except torch._dynamo.exc.Unsupported:
+                tx.output = original_output
+                tx.output.graph = graph_checkpoint
+                tx.restore_graphstate(checkpoint)
+                raise
 
         if self.value.__name__ == "cond":
             # TODO(voz): Support fake tensor dispatch for recursive
@@ -944,7 +1009,7 @@ class TorchHigherOrderOperator(VariableTracker):
             def speculate_branch(branch):
                 # NB: 0 is predicate
                 ix = 1 if branch else 2
-                return speculate_subgraph(
+                return speculate_subgraph_old(
                     args[ix], sub_args, graph_checkpoint, checkpoint
                 )
 
@@ -954,6 +1019,7 @@ class TorchHigherOrderOperator(VariableTracker):
                 true_guards,
                 true_nn_modules,
                 true_cmp,
+                _,
             ) = speculate_branch(True)
             (
                 false_r,
@@ -961,6 +1027,7 @@ class TorchHigherOrderOperator(VariableTracker):
                 false_guards,
                 false_nn_modules,
                 false_cmp,
+                _,
             ) = speculate_branch(False)
 
             true_tracked_fakes = true_cmp.output.tracked_fakes
@@ -1013,7 +1080,8 @@ class TorchHigherOrderOperator(VariableTracker):
                 body_guards,
                 body_nn_modules,
                 body_cmp,
-            ) = speculate_subgraph(
+                _,
+            ) = speculate_subgraph_old(
                 args[0],
                 [
                     get_fake_value(args[1].as_proxy().node, tx)[0],
@@ -1042,6 +1110,36 @@ class TorchHigherOrderOperator(VariableTracker):
             example_value = r.new_empty(
                 [get_fake_value(args[1].as_proxy().node, tx).shape[0], *r.shape]
             )
+        elif self.value.__name__ == "wrap":
+            checkpoint = tx.copy_graphstate()
+            (
+                body_r,
+                body_graph,
+                body_guards,
+                body_nn_modules,
+                body_cmp,
+                body_lifted_freevars,
+            ) = speculate_subgraph(
+                args[0],
+                [
+                    *args[1:],
+                ],
+                tx.output.graph,
+                checkpoint,
+            )
+
+            body_name = add_subgraph(
+                "body", torch.fx.GraphModule(body_nn_modules, body_graph)
+            )
+
+
+            # Add guards
+            tx.output.tracing_context.guards_context.dynamo_guards |= body_guards
+
+            body_node = make_attr(body_name)
+            p_args = (body_node, *(arg.as_proxy() for arg in args[1:]), *(arg for arg in body_lifted_freevars))
+            r = body_r.as_proxy().node.meta["example_value"]
+            example_value = r
         else:
             unimplemented(f"HigherOrderOperator {self.value.__name__}")
 
