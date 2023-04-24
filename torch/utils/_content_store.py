@@ -27,6 +27,8 @@
 # map to the same (padded) storage.  We think this will be immaterial for most
 # users.
 
+import ctypes
+import hashlib
 import os.path
 import struct
 from typing import Optional
@@ -94,17 +96,29 @@ class ContentStoreWriter:
     #       0000..00
     #   tensors/
     #     name
-    def __init__(self, loc):
+    def __init__(self, loc, stable_hash=False):
         self.loc = loc
         self.seen_storage_hashes = set()
+        self.stable_hash = stable_hash
 
     def write_storage(self, storage):
-        h = hash_storage(storage)
+        if self.stable_hash:
+            cpu_storage = storage.cpu()
+            # TODO: make storage support buffer protocol so this isn't
+            # necessary
+            buf = (ctypes.c_byte * cpu_storage.nbytes()).from_address(
+                cpu_storage.data_ptr()
+            )
+            sha1 = hashlib.sha1()
+            sha1.update(buf)
+            h = sha1.hexdigest()
+        else:
+            h = hash_storage(storage)
         if h in self.seen_storage_hashes:
             return h
         # TODO: consider not using torch.save for this; we don't actually
         # need any metadata for the storage
-        subfolder = os.path.join(self.loc, "storages", h[:2])
+        subfolder = os.path.join(self.loc, "storages")
         os.makedirs(subfolder, exist_ok=True)
         torch.save(storage, os.path.join(subfolder, h))
         self.seen_storage_hashes.add(h)
@@ -140,7 +154,7 @@ class ContentStoreReader:
             if s is not None:
                 return s
         s = torch.load(
-            os.path.join(self.loc, "storages", h[:2], h), weights_only=True
+            os.path.join(self.loc, "storages", h), weights_only=True
         )._untyped_storage
         self.storage_cache[h] = StorageWeakRef(s)
         return s
