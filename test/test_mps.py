@@ -125,6 +125,8 @@ def mps_ops_grad_modifier(ops):
         # trunc_tensor not working properly for float16
         'divtrunc_rounding': [torch.float16],
         'fmod': [torch.float16],
+
+        'nn.functional.layer_norm': [torch.float16],
     }
 
     MACOS_12_3_XFAILLIST_GRAD = {
@@ -10252,6 +10254,8 @@ class TestConsistency(TestCaseMPS):
         'linalg.vector_norm',
         'addr', 'var_mean',
         'var_mean_unbiased',
+        'native_layer_norm',
+        'nn.functional.layer_norm',
 
         # for macOS 12
         'masked.normalize', 'masked.sum', 'masked.var',
