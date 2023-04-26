@@ -153,6 +153,11 @@ class Foo:  # noqa: B209
         self.a = a
         self.b = b
 
+@torch.fx.has_side_effect
+@torch.fx.wrap
+def side_effect_func(x: torch.Tensor):
+    print(x)
+
 class TestFX(JitTestCase):
     def setUp(self):
         super().setUp()
@@ -2751,7 +2756,7 @@ class TestFX(JitTestCase):
         mod_false = symbolic_trace(mod, concrete_args={'y': False})
         self.assertEqual(mod_true(3, True), 6)
         print(mod_true.code)
-        assert(any([i.target == torch._assert for i in mod_true.graph.nodes]))
+        assert(any(i.target == torch._assert for i in mod_true.graph.nodes))
         with self.assertRaises(AssertionError):
             mod_true(3, False)
         self.assertEqual(mod_false(3, False), 3)
@@ -3985,6 +3990,24 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
                                  f"backwards-compatibility classification! Please decorate these "
                                  f"API(s) with `@torch.fx._compatibility.compatibility` to specify "
                                  f"BC guarantees.")
+
+    def test_adding_side_effect_function(self):
+        class TestModule(torch.nn.Module):
+            def forward(self, x):
+                side_effect_func(x)
+                return x
+
+        gm = torch.fx.symbolic_trace(TestModule())
+        self.assertEqual(len(gm.graph.nodes), 3)
+        gm.graph.eliminate_dead_code()
+        gm.recompile()
+        self.assertEqual(len(gm.graph.nodes), 3)
+        found = False
+        for node in gm.graph.nodes:
+            if node.op == 'call_function' and node.target == side_effect_func:
+                found = True
+        self.assertTrue(found)
+
 
 class TestFunctionalTracing(JitTestCase):
     def setUp(self):

@@ -1003,6 +1003,7 @@ def main():
         'sympy',
         'networkx',
         'jinja2',
+        'fsspec',
     ]
 
     extras_require = {
