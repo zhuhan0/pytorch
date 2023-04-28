@@ -192,12 +192,12 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> cudnn_batch_norm(
         at::maybe_data_ptr(running_mean),
         at::maybe_data_ptr(running_var),
         epsilon,
-        save_mean.data_ptr(),
-        save_var.data_ptr(),
+        save_mean.mutable_data_ptr(),
+        save_var.mutable_data_ptr(),
         nullptr,
         workspace.data_ptr(),
         workspace_size,
-        reserve.data_ptr(),
+        reserve.mutable_data_ptr(),
         reserve_size));
   } else {
     reserve = at::empty({0}, input->options().dtype(kByte));
