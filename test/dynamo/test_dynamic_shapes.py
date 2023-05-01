@@ -28,13 +28,6 @@ test_classes = {}
 
 ALL_DYNAMIC_XFAILS = {
     "MiscTests": [],
-    "ReproTests": [
-        # Could not infer dtype of torch._C.SymIntNode
-        "test_convert_boxes_to_pooler_format",
-    ],
-    "SubGraphTests": [
-        "test_enumerate_not_break_graph",
-    ],
 }
 
 XFAIL_HITS = 0
@@ -81,15 +74,14 @@ tests = [
     test_subgraphs.SubGraphTests,
 ]
 for test in tests:
-    make_dynamic_cls(test)
     make_dynamic_cls(test, static_default=True)
 
-assert XFAIL_HITS == len(ALL_DYNAMIC_XFAILS) * 2
+assert XFAIL_HITS == len(ALL_DYNAMIC_XFAILS)
 
 # Single config failures
 
 unittest.expectedFailure(
-    DynamicShapesMiscTests.test_change_backends_dynamic_shapes
+    StaticDefaultDynamicShapesMiscTests.test_change_backends
     # '__torch__.torch.SymInt (of Python compilation unit at: 0x4c9c0e0)'
     # object has no attribute or method '__ne__'
     # NB: I don't think this ever can actually work, cuz TorchScript
@@ -98,39 +90,40 @@ unittest.expectedFailure(
 
 
 unittest.expectedFailure(
-    DynamicShapesMiscTests.test_slice_input_dynamic_shapes
+    StaticDefaultDynamicShapesMiscTests.test_slice_input
     # NotImplementedError: SymNodeVariable() is not a constant
 )
 
 unittest.expectedFailure(
-    DynamicShapesNNModuleTests.test_lazy_module1_dynamic_shapes
+    StaticDefaultDynamicShapesNNModuleTests.test_lazy_module1
     # RuntimeError: SymIntArrayRef expected to contain only concrete integers
 )
 
 unittest.expectedFailure(
-    DynamicShapesNNModuleTests.test_lazy_module2_dynamic_shapes
+    StaticDefaultDynamicShapesNNModuleTests.test_lazy_module2
     # RuntimeError: SymIntArrayRef expected to contain only concrete integers
 )
 
 unittest.expectedFailure(
-    DynamicShapesNNModuleTests.test_lazy_module3_dynamic_shapes
+    StaticDefaultDynamicShapesNNModuleTests.test_lazy_module3
     # RuntimeError: SymIntArrayRef expected to contain only concrete integers
 )
 
 unittest.expectedFailure(
-    DynamicShapesNNModuleTests.test_lazy_module4_dynamic_shapes
+    StaticDefaultDynamicShapesNNModuleTests.test_lazy_module4
     # RuntimeError: SymIntArrayRef expected to contain only concrete integers
 )
 
 unittest.expectedFailure(
-    DynamicShapesNNModuleTests.test_lazy_module5_dynamic_shapes
+    StaticDefaultDynamicShapesNNModuleTests.test_lazy_module5
     # RuntimeError: SymIntArrayRef expected to contain only concrete integers
 )
 
 unittest.expectedFailure(
-    DynamicShapesNNModuleTests.test_lazy_module6_dynamic_shapes
+    StaticDefaultDynamicShapesNNModuleTests.test_lazy_module6
     # RuntimeError: SymIntArrayRef expected to contain only concrete integers
 )
+
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
