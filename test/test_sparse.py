@@ -71,7 +71,7 @@ def gradcheck_semantics(test_name='gradcheck'):
     gradcheck_sparse.masked = False
     gradcheck_masked.masked = True
     return parametrize(test_name, [
-        subtest(gradcheck_sparse, name='sparse'),
+        subtest(gradcheck_sparse, name='non_masked'),
         subtest(gradcheck_masked, name='masked')])
 
 
@@ -4636,29 +4636,37 @@ class TestSparseAny(TestCase):
     @precisionOverride({torch.bfloat16: 5e-4, torch.float16: 5e-3})
     @all_sparse_layouts('layout', include_strided=False)
     def test_reductions(self, layout, device, dtype, op):
-        count = 0
-        for sample in op.sample_inputs_sparse(layout, device, dtype):
-            count += 1
+        if not op.supports_sparse_layout(layout):
+            self.skipTest(f'{layout} is not supported in `{op.name}` OpInfo definition. Skipping!')
 
+        if (
+                layout in {torch.sparse_csr, torch.sparse_csc, torch.sparse_bsr, torch.sparse_bsc}
+                and dtype in {torch.bool, torch.uint8}):
+            self.skipTest('Requires fix to gh-98495. Skipping!')
+
+        for sample in op.sample_inputs_sparse(layout, device, dtype):
             t_inp, t_args, t_kwargs = sample.input, sample.args, sample.kwargs
+
             result = op.op(t_inp, *t_args, **t_kwargs)
 
             #  Checking invariant rop(inp, ...).to_dense() == rop(inp.to_dense(), ...)
             dense = op.op(t_inp.to_dense(), *t_args, **t_kwargs)
             self.assertEqual(result, dense)
 
-        if count == 0:
-            # we count samples to avoid false-positive test reports
-            self.skipTest('no sample inputs')
-
     @onlyNativeDeviceTypes
     @suppress_warnings
     @ops(reduction_ops_with_sparse_support, allowed_dtypes=(torch.float32, torch.float64, torch.complex64, torch.complex128))
     @all_sparse_layouts('layout', include_strided=False)
     def test_reductions_backward(self, layout, device, dtype, op):
+        # TODO: Once gradcheck supports sparse outputs, use gradcheck
+        # for testing the reductions backward and merge this test to
+        # test_reductions.
+        if not op.supports_sparse_layout(layout):
+            self.skipTest(f'{layout} is not supported in `{op.name}` OpInfo definition. Skipping!')
         count = 0
         for sample in op.sample_inputs_sparse(layout, device, dtype, requires_grad=True):
             t_inp, t_args, t_kwargs = sample.input, sample.args, sample.kwargs
+
             r = op.op(t_inp, *t_args, **t_kwargs)
             if r.numel() != 0:
                 r = r.sum()
@@ -4670,9 +4678,7 @@ class TestSparseAny(TestCase):
             else:
                 self.skipTest('NOT IMPL')
 
-        if count == 0:
-            # we count samples to avoid false-positive test reports
-            self.skipTest('no sample inputs')
+        self.assertNotEqual(count, 0)
 
     @onlyNativeDeviceTypes
     @suppress_warnings
