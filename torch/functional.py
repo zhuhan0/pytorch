@@ -534,7 +534,7 @@ def stft(input: Tensor, n_fft: int, hop_length: Optional[int] = None,
     .. math::
         X[\omega, m] = \sum_{k = 0}^{\text{win\_length-1}}%
                             \text{window}[k]\ \text{input}[m \times \text{hop\_length} + k]\ %
-                            \exp\left(- j \frac{2 \pi \cdot \omega k}{\text{win\_length}}\right),
+                            \exp\left(- j \frac{2 \pi \cdot \omega k}{\text{n\_fft}}\right),
 
     where :math:`m` is the index of the sliding window, and :math:`\omega` is
     the frequency :math:`0 \leq \omega < \text{n\_fft}` for ``onesided=False``,
@@ -623,7 +623,20 @@ def stft(input: Tensor, n_fft: int, hop_length: Optional[int] = None,
                recover the deprecated output format.
 
     Returns:
-        Tensor: A tensor containing the STFT result with shape described above
+        Tensor: A tensor containing the STFT result with shape described below
+
+    Shape:
+        - input: :math:`(B?, L)` where :math:`B?` is an optional batch dimension
+        - window: :math:`(\texttt{win\_length},)` where :math:`\texttt{win\_length} <= \texttt{n\_fft}`
+        - output: :math:`(B?, N, T, C?)` where
+           * :math:`N` is the number of frequency samples,
+             :math:`(\texttt{n\_fft} // 2) + 1` for ``onesided=True``, or otherwise
+             :math:`\texttt{n\_fft}`.
+           * :math:`T` is the number of frames, :math:`1 + L // \texttt{hop\_length}`
+             for ``center=True``, or
+             :math:`1 + (L - \texttt{n\_fft}) // \texttt{hop\_length}` otherwise.
+           * :math:`C?` is an optional length-2 dimension of real and imaginary
+             components, present when ``return_complex=False``.
 
     """
     if has_torch_function_unary(input):
@@ -708,6 +721,25 @@ Args:
 
 Returns:
     Tensor: Least squares estimation of the original signal of size (..., signal_length)
+
+Shape:
+    - input: :math:`(B?, N, T, C?)` where
+        * :math:`B?` is an optional batch dimension
+        * :math:`N` is the number of frequency samples, :math:`(\texttt{n\_fft} // 2) + 1`
+          for onesided input, or otherwise :math:`\texttt{n\_fft}`.
+        * :math:`T` is the number of frames,
+          :math:`1 + \texttt{length} // \texttt{hop\_length}` for centered stft,
+          or :math:`1 + (\texttt{length} - \texttt{n\_fft}) // \texttt{hop\_length}`
+          otherwise.
+        * :math:`C?` is an optional length-2 dimension of real and imaginary
+          components, if using stft with ``return_complex=False``
+    - window: :math:`(\texttt{win\_length},)` where :math:`\texttt{win\_length} <= \texttt{n\_fft}`
+    - output: :math:`(B?, \texttt{length}, C?)` where
+        * :math:`\texttt{length}` is reconstructed sample length, which defaults to
+          :math:`(T - 1) * \texttt{hop\_length}` for centered stft, or
+          :math:`\texttt{n\_fft} + (T - 1) * \texttt{hop\_length}` otherwise.
+        * :math:`C?` is an optional length-2 dimension of real and imaginary
+          components, present when ``return_complex=False`` and ``onesided=False``.
 """)
 
 
