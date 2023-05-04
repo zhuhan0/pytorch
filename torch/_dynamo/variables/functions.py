@@ -94,13 +94,14 @@ def _create_nested_fn(
     func.__kwdefaults__ = kwdefaults
 
     if isinstance(annotations, tuple):
-        annotation_dict = {}
-        for i in range(0, len(annotations), 2):
-            annotation_dict[annotations[i]] = annotations[i + 1]
-    else:
-        annotation_dict = annotations
+        from itertools import pairwise
 
-    func.__annotations__ = annotation_dict
+        annotations = dict(pairwise(annotations))
+
+    # TypeError: __annotations__ must be set to a dict object
+    assert annotations is None or isinstance(annotations, dict)
+    func.__annotations__ = annotations
+
     return func
 
 
