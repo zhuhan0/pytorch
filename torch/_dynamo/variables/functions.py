@@ -3,7 +3,6 @@ import enum
 import functools
 import inspect
 import itertools
-import sys
 import types
 from typing import Dict, List
 
@@ -11,11 +10,8 @@ import torch
 
 from .. import variables
 from ..allowed_functions import is_allowed, is_builtin_callable
-from ..bytecode_transformation import (
-    create_call_function,
-    create_instruction,
-    create_rot_n,
-)
+from ..bytecode_transformation import create_call_function, create_rot_n, unique_id
+from ..eval_frame import disable
 from ..exc import unimplemented
 from ..source import AttrSource, ConstantSource, DefaultsSource, GetItemSource
 from ..utils import istensor, istype, make_cell
@@ -87,6 +83,25 @@ def init_cellvars(parent, result, code):
             side_effects.store_cell(closure_cells[name], result.pop(name))
 
     return closure_cells
+
+
+def _create_nested_fn(
+    code, f_globals, name, defaults, closure, kwdefaults, annotations
+):
+    from types import FunctionType
+
+    func = FunctionType(code, f_globals, name, defaults, closure)
+    func.__kwdefaults__ = kwdefaults
+
+    if isinstance(annotations, tuple):
+        annotation_dict = {}
+        for i in range(0, len(annotations), 2):
+            annotation_dict[annotations[i]] = annotations[i + 1]
+    else:
+        annotation_dict = annotations
+
+    func.__annotations__ = annotation_dict
+    return func
 
 
 class BaseUserFunctionVariable(VariableTracker):
@@ -460,17 +475,39 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
                 parent.symbolic_locals[var] = child.symbolic_locals[var]
 
     def reconstruct(self, codegen):
-        flags = 0x00
+        create_nested_fn_name = unique_id("__create_nested_fn")
+        if create_nested_fn_name not in codegen.tx.output.root_globals:
+            codegen.tx.output.install_global(
+                create_nested_fn_name, disable(_create_nested_fn)
+            )
+
+        codegen.extend_output(
+            [
+                codegen.create_load_global(
+                    create_nested_fn_name, push_null=False, add=True
+                ),
+            ]
+        )
+        codegen(self.code)
+        codegen.extend_output([codegen._create_load_const(self.f_globals)])
+        codegen(self.fn_name)
+
         if self.defaults:
-            flags |= 0x01
             codegen(self.defaults)
+        else:
+            codegen.extend_output([codegen.create_load_const(None)])
+
+        if self.closure:
+            codegen(self.closure)
+        else:
+            codegen.extend_output([codegen.create_load_const(None)])
+
         if self.kwdefaults:
-            flags |= 0x02
             codegen(self.kwdefaults)
-        if isinstance(
-            self.annotations, (variables.ConstDictVariable, variables.TupleVariable)
-        ):
-            flags |= 0x04
+        else:
+            codegen.extend_output([codegen.create_load_const(None)])
+
+        if self.annotations:
             try:
                 if isinstance(self.annotations, variables.ConstDictVariable):
                     annotations = {
@@ -484,26 +521,10 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
                 codegen.extend_output([codegen._create_load_const(annotations)])
             except NotImplementedError:
                 codegen(self.annotations)
-        if self.closure:
-            flags |= 0x08
-            codegen(self.closure)
-        codegen(self.code)
-        if sys.version_info < (3, 11):
-            codegen(self.fn_name)
-        codegen.extend_output([create_instruction("MAKE_FUNCTION", arg=flags)])
+        else:
+            codegen.extend_output([codegen.create_load_const(None)])
 
-        # When graph breaks happen, the global variables of resumed function
-        # come from the outermost function which may not have globals needed
-        # by this nested function, we have to add these missing globals.
-        root_globals = codegen.tx.output.root_globals
-        for key in self.code.value.co_names:
-            if key not in self.f_globals:
-                continue
-            if key in root_globals:
-                if not (key.startswith("__") and key.endswith("__")):
-                    assert root_globals[key] == self.f_globals[key]
-            else:
-                root_globals[key] = self.f_globals[key]
+        codegen.extend_output(create_call_function(7, push_null=True))
 
         if self.wraps_source:
             codegen.load_import_from("functools", "wraps")
