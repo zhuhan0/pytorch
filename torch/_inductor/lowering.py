@@ -1567,6 +1567,21 @@ make_fallback(aten.zeros.names)
 make_fallback(aten.exponential.default, warn=False)
 
 
+@register_lowering(aten.copy)
+def copy(self, src, non_blocking=False):
+    x = src
+    if self.get_device() != src.get_device():
+        x = to_device(x, self.get_device())
+    if self.get_dtype() == src.get_dtype():
+        x = to_dtype(x, self.get_dtype())
+
+    # TODO: respect storage offset?
+    if self.get_size() != src.get_size():
+        out = expand(src, self.get_size())
+        return clone(out)
+    return clone(src)
+
+
 @register_lowering(aten.clone)
 def clone(x, *, memory_format=0):
     # TODO(jansel): memory format
