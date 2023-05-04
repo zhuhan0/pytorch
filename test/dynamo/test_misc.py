@@ -5104,7 +5104,10 @@ def fn():
 
     def test_nested_function_resuming_with_correct_globals(self):
         # https://github.com/pytorch/pytorch/issues/99665
-        from .utils import outer_func
+        try:
+            from .utils import outer_func
+        except ImportError:
+            from utils import outer_func
 
         def gn(x, y):
             return x + y
