@@ -209,6 +209,9 @@ class BaseSchedulerNode:
     def can_inplace(self, read_dep: dependencies.MemoryDep):
         return False
 
+    def has_side_effects(self):
+        return False
+
     def allocate(self):
         if not self.node.should_allocate():
             return
@@ -335,6 +338,9 @@ class ExternKernelSchedulerNode(BaseSchedulerNode):
 
     def is_extern(self):
         return True
+
+    def has_side_effects(self):
+        return hasattr(self.node, "has_side_effects") and self.node.has_side_effects()
 
     def can_inplace(self, read_dep: dependencies.MemoryDep):
         if self.get_aliases() or self.is_template():
@@ -814,7 +820,7 @@ class Scheduler:
         """
         updated_nodes = []
         for node in self.nodes:
-            if node.users:
+            if node.users or node.has_side_effects():
                 updated_nodes.append(node)
             else:
                 # dead code
