@@ -476,10 +476,9 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
 
     def reconstruct(self, codegen):
         create_nested_fn_name = unique_id("__create_nested_fn")
-        if create_nested_fn_name not in codegen.tx.output.root_globals:
-            codegen.tx.output.install_global(
-                create_nested_fn_name, disable(_create_nested_fn)
-            )
+        codegen.tx.output.install_global(
+            create_nested_fn_name, disable(_create_nested_fn)
+        )
 
         codegen.extend_output(
             [
