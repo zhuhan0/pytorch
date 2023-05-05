@@ -234,11 +234,63 @@ class AutogradFunctionVariable(VariableTracker):
 
         VariableTracker.apply(visit, (args, kwargs))
 
-        if requires_grad and torch.is_grad_enabled():
-            # TODO(jansel): handle this in training mode
-            unimplemented("autograd.Function with requires_grad")
+        ctx = AutogradFunctionContextVariable.create(tx)
+        args = [ctx, *args]
 
-        args = [AutogradFunctionContextVariable.create_for_inference(tx), *args]
+        if requires_grad and torch.is_grad_enabled():
+            # Note - this is the same check used in autograd/function.py, except inverted.
+            # If we want to support functorch transforms here, we will need to enable this.
+            if (
+                self.fn_cls.setup_context
+                != torch.autograd.function._SingleLevelFunction.setup_context
+            ):
+                unimplemented(
+                    "NYI - requires_grad on autograd.Function with custom context"
+                )
+
+            from .torch import is_fn_safe_to_run, TorchHigherOrderOperator
+
+            def trampoline_autograd_apply(*args, **kwargs):
+                return self.fn_cls.apply(*args, **kwargs)
+
+            def trampoline_autograd_fwd(*args, **kwargs):
+                return self.fn_cls.forward(*args, **kwargs)
+
+            def trampoline_autograd_bwd(*args, **kwargs):
+                return self.fn_cls.backward(*args, **kwargs)
+
+            # Speculate fwd, will raise unimplemented and bubble up if not sound, or will accumulate guards
+            # onto tx if sound.
+            # TODO(voz): NOTE: This function identity is unguarded, but the odds of someone swapping self.fn_cls from
+            # autograd fn to something else is very low.
+            higher_order_autograd_fn = TorchHigherOrderOperator(trampoline_autograd_fwd)
+            speculated_fwd_result = higher_order_autograd_fn.call_function(
+                tx, args, kwargs
+            )
+
+            # On varying strides of grads
+            #
+            # A varying stride in speculated_fwd_result can produce potentially unsound code.
+            # To quote rzou, It does matter if the autograd.Function branches on the strides of the Tensor and is
+            # actually unsafe in one of the branches. The actual case where this matters is if a Tensor is a Tensor
+            # subclass -- it would be more likely that in the Tensor subclass case there will be unsafe behavior.
+            # We think this is unlikely to happen today. If we find this happening, and we think that capturing
+            # autograd function is leading to issues, we can extend this to rewrite bwd to coerce the guards to
+            # be the expected strides.
+            bwd_args = [ctx, speculated_fwd_result]
+            # ctx.value.saved_tensors = ctx.value.to_save
+            if not is_fn_safe_to_run(
+                tx, TorchHigherOrderOperator(trampoline_autograd_bwd), bwd_args
+            ):
+                unimplemented("Unsafe bwd in autograd.function")
+
+            # If fwd and backward are sound, we want apply in the graph.
+            # And we don't want backwards for the obvious reasons.
+            args = args[1:]
+            return TorchHigherOrderOperator(trampoline_autograd_apply).call_function(
+                tx, args, kwargs
+            )
+
         options = VariableTracker.propagate(self, args, kwargs.values())
         options["source"] = AttrSource(AttrSource(self.source, "__class__"), "forward")
         fn = self.fn_cls.forward
@@ -260,6 +312,16 @@ class AutogradFunctionVariable(VariableTracker):
         return AutogradFunctionVariable(self.fn_cls, source=self.source, **options)
 
 
+class SaveSimulatingAutogradFunctionContext(torch.autograd.function.FunctionCtx):
+    def __init__(self):
+        super().__init__()
+        self.saved_tensors = []
+
+    def save_for_backward(self, *tensors: torch.Tensor):
+        super().save_for_backward(tensors)
+        self.saved_tensors.extend([*tensors])
+
+
 class AutogradFunctionContextVariable(UserDefinedObjectVariable):
     """
     Tracks an autograd.Function() context using mutation tracking in side_effects.py
@@ -270,13 +332,26 @@ class AutogradFunctionContextVariable(UserDefinedObjectVariable):
         self.inference = inference
 
     @staticmethod
-    def create_for_inference(tx):
-        return tx.output.side_effects.track_object_new(
+    def create(tx):
+        out = tx.output.side_effects.track_object_new(
             None,
-            torch.autograd.function.FunctionCtx,
+            SaveSimulatingAutogradFunctionContext,
             functools.partial(AutogradFunctionContextVariable, inference=True),
             {},
         )
+
+        def lazy_proxy_fn():
+            proxy = tx.output.create_proxy(
+                "call_function", SaveSimulatingAutogradFunctionContext, tuple(), {}
+            )
+            proxy.node.meta["example_value"] = out.value
+            return proxy
+
+        out.lazy_proxy_fn = lazy_proxy_fn
+        return out
+
+    def as_proxy(self):
+        return self.lazy_proxy_fn()
 
     def call_method(
         self,
