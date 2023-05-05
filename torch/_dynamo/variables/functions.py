@@ -10,8 +10,7 @@ import torch
 
 from .. import variables
 from ..allowed_functions import is_allowed, is_builtin_callable
-from ..bytecode_transformation import create_call_function, create_rot_n, unique_id
-from ..eval_frame import disable
+from ..bytecode_transformation import create_call_function, create_rot_n
 from ..exc import unimplemented
 from ..source import AttrSource, ConstantSource, DefaultsSource, GetItemSource
 from ..utils import istensor, istype, make_cell
@@ -476,18 +475,7 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
                 parent.symbolic_locals[var] = child.symbolic_locals[var]
 
     def reconstruct(self, codegen):
-        create_nested_fn_name = unique_id("__create_nested_fn")
-        codegen.tx.output.install_global(
-            create_nested_fn_name, disable(_create_nested_fn)
-        )
-
-        codegen.extend_output(
-            [
-                codegen.create_load_global(
-                    create_nested_fn_name, push_null=False, add=True
-                ),
-            ]
-        )
+        codegen.load_import_from(__name__, "_create_nested_fn")
         codegen(self.code)
         codegen.extend_output([codegen._create_load_const(self.f_globals)])
         codegen(self.fn_name)
