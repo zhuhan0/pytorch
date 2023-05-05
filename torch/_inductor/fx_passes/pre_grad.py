@@ -17,17 +17,19 @@ from .. import config, overrides
 
 from ..fx_utils import matches_module_function_pattern
 from ..mkldnn import mkldnn_fuse_fx
-from ..pattern_matcher import init_once_fakemode, PatternMatcherPass
+from ..pattern_matcher import init_once_fakemode, PatternMatcherPass, stable_topological_sort
 from ..utils import is_cpu_device
 
 log = logging.getLogger(__name__)
 
 normalize_split_pass = PatternMatcherPass()
 merge_splits_pass = PatternMatcherPass()
+merge_split_cat_pass = PatternMatcherPass()
 
 pattern_matcher_passes: List[PatternMatcherPass] = [
     normalize_split_pass,
     merge_splits_pass,
+    merge_split_cat_pass,
 ]
 
 
@@ -65,6 +67,7 @@ def pre_grad_passes(gm, example_inputs):
         for pattern_matcher_pass in pattern_matcher_passes:
             pattern_matcher_pass.apply(gm.graph)
 
+    stable_topological_sort(gm.graph)
     gm.graph.lint()
     gm.recompile()
 
